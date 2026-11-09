@@ -16,8 +16,9 @@ ffmpeg-8.1-full_build-shared/
 opencv/
 sdk/
 
-# 二进制运行库
+# 二进制运行库：排除全部 DLL，但保留根目录的运行必需 DLL
 *.dll
+!/*.dll
 
 # 日志
 日志/
