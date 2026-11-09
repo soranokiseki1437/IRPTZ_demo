@@ -14,6 +14,10 @@ int main(int argc, char *argv[])
 {
     QApplication a(argc, argv);
 
+    // 版本 + 构建时间戳：写入日志开头，用于确认现场运行的是哪次构建
+    a.setApplicationVersion(QStringLiteral("%1 (build %2 %3)")
+                                .arg(PROJECT_VERSION, __DATE__, __TIME__));
+
     // Step6：限制 OpenCV 内部线程池，避免与 Qt/解码线程过度争抢 CPU
     cv::setNumThreads(2);
 

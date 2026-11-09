@@ -8,6 +8,9 @@
 #include <QDir>
 #include <QMouseEvent>
 #include <QPainter>
+#include <QElapsedTimer>
+
+#include <memory>
 
 MainWindow::MainWindow(QWidget *parent) : QMainWindow(parent)
     , ui(new Ui::MainWindow)
@@ -33,6 +36,28 @@ MainWindow::MainWindow(QWidget *parent) : QMainWindow(parent)
     , m_trackBoxOccluded(false)
 {
     ui->setupUi(this);
+
+    // 限制日志窗口块数上限：QTextBrowser 无上限时，高频 append（角度反馈/TX/RX）
+    // 会让文档越来越大，追加成本随之上涨，直接拖垮 UI 线程（云台操作卡顿的主因之一）
+    ui->textLog->document()->setMaximumBlockCount(300);
+
+    // UI 线程卡顿探测：250ms 心跳。若两次心跳间隔远超周期，说明 UI 线程被长任务阻塞
+    // （如某个同步 SDK 网络调用），日志会直接给出卡顿时长证据
+    {
+        const auto heartbeat = std::make_shared<QElapsedTimer>();
+        heartbeat->start();
+        auto *stallTimer = new QTimer(this);
+        connect(stallTimer, &QTimer::timeout, this, [heartbeat]() {
+            const qint64 gap = heartbeat->elapsed();
+            heartbeat->restart();
+            if (gap > 800) {
+                qWarning() << "[MainWindow] UI 线程疑似卡顿: 心跳间隔 =" << gap
+                           << "ms (正常约 250ms)";
+            }
+        });
+        stallTimer->start(250);
+    }
+
     initUI();
     
     // 设置管理器之间的关联
@@ -110,6 +135,9 @@ MainWindow::MainWindow(QWidget *parent) : QMainWindow(parent)
     bindDirection(ui->right_up,   0x0A, 1, 1);  // 右上
     bindDirection(ui->left_down,  0x14, 1, 1);  // 左下
     bindDirection(ui->right_down, 0x12, 1, 1);  // 右下
+
+    // 方向盘中心"停止"按钮：立即停止云台并终止周期重发
+    connect(ui->stop, &QPushButton::clicked, this, &MainWindow::stopManualMove);
     
     // === 镜头控制按钮绑定 ===
     // 【关键】镜头控制按钮禁用 autoRepeat！
@@ -237,8 +265,16 @@ void MainWindow::initUI()
     initTrackingModule();
 
     // 图像调节与校准控件连接
+    m_tempOsdEnabled = (ui->checkOSD->checkState() == Qt::Checked);
     connect(ui->checkOSD, &QCheckBox::checkStateChanged, this, [this](Qt::CheckState state){
         m_tempOsdEnabled = (state == Qt::Checked);
+        // 测温调用单次阻塞约 3s，且与云台指令共用同一 SDK 通道；
+        // 只有需要显示温度时才轮询，避免拖慢云台操作
+        if (m_tempOsdEnabled) {
+            if (m_rgbConnected) m_tempPollTimer->start(5000);
+        } else {
+            m_tempPollTimer->stop();
+        }
     });
 
     connect(ui->btnCaptureTemp, &QPushButton::clicked, this, [this](){
@@ -290,6 +326,23 @@ void MainWindow::initRGBModule()
     if (ui->btnIrisOpen) ui->btnIrisOpen->setEnabled(false);
     if (ui->btnIrisClose) ui->btnIrisClose->setEnabled(false);
     if (ui->spinLensSpeed) ui->spinLensSpeed->setEnabled(false);
+
+    // 设备/厂家 SDK 只提供 46~49（变倍、聚焦）与 53（自动聚焦，设备返回 err=10 不支持），
+    // 没有光圈命令。光圈相关控件无实际命令可下发，直接禁用并说明，避免出现"点了没反应"的按钮
+    const QString irisTip = "厂家 SDK 未提供光圈控制命令，该设备光圈不可远程调节";
+    if (ui->btnIrisOpen) ui->btnIrisOpen->setToolTip(irisTip);
+    if (ui->btnIrisClose) ui->btnIrisClose->setToolTip(irisTip);
+    if (ui->checkBoxManualIris) {
+        ui->checkBoxManualIris->setChecked(false);
+        ui->checkBoxManualIris->setEnabled(false);
+        ui->checkBoxManualIris->setToolTip(irisTip);
+    }
+    // 自动聚焦命令(53)设备不支持，镜头固定为手动对焦：复选框常选中并禁用
+    if (ui->checkBoxManualFocus) {
+        ui->checkBoxManualFocus->setChecked(true);
+        ui->checkBoxManualFocus->setEnabled(false);
+        ui->checkBoxManualFocus->setToolTip("设备不支持自动聚焦，镜头始终为手动对焦");
+    }
 }
 
 void MainWindow::initTrackingModule()
@@ -356,6 +409,7 @@ void MainWindow::updatePTZUIState()
     ui->btnStop->setEnabled(m_ptzConnected);
     ui->btnQuery->setEnabled(m_ptzConnected);
     ui->btnReset->setEnabled(m_ptzConnected);
+    ui->btnSetHome->setEnabled(m_ptzConnected);
     ui->spinPan->setEnabled(m_ptzConnected);
     ui->spinTilt->setEnabled(m_ptzConnected);
     ui->spinSpeed->setEnabled(m_ptzConnected);
@@ -383,11 +437,12 @@ void MainWindow::updateRGBUIState()
         if (ui->btnZoomIn) ui->btnZoomIn->setEnabled(true);
         if (ui->btnZoomOut) ui->btnZoomOut->setEnabled(true);
         if (ui->spinLensSpeed) ui->spinLensSpeed->setEnabled(true);
-        if (ui->checkBoxManualFocus) ui->checkBoxManualFocus->setEnabled(true);
-        if (ui->checkBoxManualIris) ui->checkBoxManualIris->setEnabled(true);
-        
-        // 聚焦按钮和光圈按钮的状态由相应的信号控制，这里不需要设置
-        // 因为登录成功后会自动触发 getFocusModeFromDevice() 和 getIrisModeFromDevice()，然后触发信号更新
+        // 该设备只有手动变倍/聚焦可用：聚焦按钮直接启用；
+        // 光圈与自动聚焦厂家未提供可用命令，相关控件保持禁用（见 initRGBModule）
+        if (ui->btnFocusNear) ui->btnFocusNear->setEnabled(true);
+        if (ui->btnFocusFar) ui->btnFocusFar->setEnabled(true);
+        if (ui->btnIrisOpen) ui->btnIrisOpen->setEnabled(false);
+        if (ui->btnIrisClose) ui->btnIrisClose->setEnabled(false);
     } else {
         ui->rgbBtnConnect->setText("连接");
         ui->rgbLabelStatus->setText("状态: 未连接");
@@ -428,26 +483,54 @@ void MainWindow::displayImage(const QImage &image)
         return;
     }
 
-    // 保存最后一帧（用于框选初始化）
-    m_lastFrame = image.copy();
+    // 保存最后一帧（用于框选初始化）。
+    // QImage 隐式共享（解码帧持有独立缓冲，下游均为只读），O(1) 赋值即可，
+    // 不要 .copy() —— 那是每帧 5MB 的无谓深拷贝
+    m_lastFrame = image;
 
-    // 显示图片（C8：缩放结果缓存到 m_scaledPixmap，跟踪框重绘时复用）
-    QPixmap pixmap = QPixmap::fromImage(image);
-    QSize labelSize = ui->rgbLabelImage->size();
-    m_scaledPixmap = pixmap.scaled(labelSize, Qt::KeepAspectRatio, Qt::SmoothTransformation);
+    // 排障：每 5s 输出一次显示链路耗时，定位 UI 线程卡顿
+    static QElapsedTimer s_perfTimer;
+    static bool s_perfTimerInit = false;
+    if (!s_perfTimerInit) {
+        s_perfTimer.start();
+        s_perfTimerInit = true;
+    }
+    const bool logPerf = s_perfTimer.elapsed() >= 5000;
+    QElapsedTimer frameTimer;
+    if (logPerf) frameTimer.start();
+
+    // 显示图片（C8：缩放结果缓存到 m_scaledPixmap，跟踪框重绘时复用）。
+    // 先把 QImage 缩放到显示尺寸再转 QPixmap：只转换实际显示的像素量；
+    // 视频预览用 FastTransformation，SmoothTransformation 在 20fps 下 CPU 开销过大
+    QPixmap pixmap = QPixmap::fromImage(
+        image.scaled(ui->rgbLabelImage->size(), Qt::KeepAspectRatio, Qt::FastTransformation));
+    m_scaledPixmap = pixmap;
     m_scaledFrameSize = image.size();
+    const qint64 scaleMs = logPerf ? frameTimer.restart() : 0;
+
+    // 没有叠加内容时不进入 drawTrackBoxOnPixmap：
+    // 其内部构造 QPainter 会触发 pixmap 写时深拷贝（每帧额外一次大内存复制）
+    const bool hasOverlay =
+        (m_tempOsdEnabled && (m_globalMaxTemp != 0.0f || m_globalMinTemp != 0.0f))
+        || (m_trackBoxVisible && !m_trackBox.isEmpty() && m_scaledFrameSize.isValid());
+
+    ui->labelVideoResolution->setText(QString("分辨率: %1×%2").arg(image.width()).arg(image.height()));
+    ui->rgbLabelImage->setPixmap(hasOverlay ? drawTrackBoxOnPixmap(m_scaledPixmap) : m_scaledPixmap);
+
+    if (logPerf) {
+        qInfo() << "[MainWindow] 显示链路耗时: 缩放+转QPixmap =" << scaleMs << "ms"
+                << " 叠加+显示 =" << frameTimer.elapsed() << "ms";
+        s_perfTimer.restart();
+    }
 
     // 现场排障：确认显示控件尺寸有效（label 尺寸为 0 时 scaled 结果为空，界面只会显示占位文字）
     static bool s_firstDisplayLogged = false;
     if (!s_firstDisplayLogged) {
         s_firstDisplayLogged = true;
-        qInfo() << "[MainWindow] 首次显示: label 尺寸 =" << labelSize
+        qInfo() << "[MainWindow] 首次显示: label 尺寸 =" << ui->rgbLabelImage->size()
                 << " 可见 =" << ui->rgbLabelImage->isVisible()
                 << " 缩放后 =" << m_scaledPixmap.size();
     }
-
-    ui->labelVideoResolution->setText(QString("分辨率: %1×%2").arg(image.width()).arg(image.height()));
-    ui->rgbLabelImage->setPixmap(drawTrackBoxOnPixmap(m_scaledPixmap));
 }
 
 // 在缩放 pixmap 上叠画跟踪框与测温信息
@@ -548,14 +631,23 @@ void MainWindow::on_btnQuery_clicked()
 void MainWindow::on_btnReset_clicked()
 {
     if (!m_ptzController) return;
-    
-    qDebug() << "[复位] 云台回到初始位置 (0, 0)";
-    ui->textLog->append("云台复位 -> 回到初始位置 (0°, 0°)");
-    
-    // 从界面速度控件读取速度（与方向按钮保持一致），不再使用固定 0.5
-    float speed = static_cast<float>(ui->spinSpeed->value());
-    qDebug() << "[复位] 使用界面速度:" << speed;
-    emit ptzMoveTo(0.0f, 0.0f, speed);
+
+    qDebug() << "[复位] 调用预置位 1（复位点）";
+    ui->textLog->append("云台复位 -> 调用复位点（若与自检位置不一致，请先点“把当前位置设为复位点”示教）");
+
+    // 设备不支持绝对角度定位（位置回读恒为 0），复位改为调用预先示教的预置位 1
+    emit ptzCallPreset(1);
+}
+
+void MainWindow::on_btnSetHome_clicked()
+{
+    if (!m_ptzController) return;
+
+    qDebug() << "[复位] 把当前位置保存为预置位 1（复位点）";
+    ui->textLog->append("正在保存当前位置为复位点（结果见日志）");
+
+    // SET_PRESET 保存的是云台当前物理位置，不需要角度回读
+    emit ptzSetPreset(1);
 }
 
 // 按住方向键：立即下发一次方向命令，并启动周期重发维持云台持续转动
@@ -564,6 +656,9 @@ void MainWindow::startManualMove(uint8_t cmd2, uint8_t hSpeed, uint8_t vSpeed)
     m_ptzManualCmd2 = cmd2;
     m_ptzManualHSpeed = hSpeed;
     m_ptzManualVSpeed = vSpeed;
+    // 手动操作期间暂停测温轮询，把 SDK 控制通道让给云台指令
+    m_tempPollPaused = m_tempPollTimer->isActive();
+    m_tempPollTimer->stop();
     emit ptzMoveDirection(cmd2, hSpeed, vSpeed);
     m_ptzManualRepeatTimer->start();
 }
@@ -573,6 +668,11 @@ void MainWindow::stopManualMove()
 {
     m_ptzManualRepeatTimer->stop();
     emit ptzStop();
+    // 松开后恢复测温轮询（仅当温度显示开启且按住前处于运行状态）
+    if (m_tempPollPaused) {
+        m_tempPollPaused = false;
+        if (m_tempOsdEnabled) m_tempPollTimer->start(5000);
+    }
 }
 
 void MainWindow::handleAngleReceived(float pan, float tilt, float panSpeed, float tiltSpeed)
@@ -581,10 +681,9 @@ void MainWindow::handleAngleReceived(float pan, float tilt, float panSpeed, floa
     if (m_deviceManager && m_deviceManager->getDataRecorder()) {
         m_deviceManager->getDataRecorder()->updatePTZData(pan, tilt, panSpeed, tiltSpeed);
     }
-    
-    // 更新日志
-    ui->textLog->append(QString("云台反馈 -> 水平: %1°  垂直: %2°  水平速度: %3  垂直速度: %4")
-                        .arg(pan).arg(tilt).arg(panSpeed).arg(tiltSpeed));
+
+    // 注意：此处不要再逐条 append 到 textLog —— 角度轮询 10Hz，
+    // 高频追加会拖垮 UI 线程（RX/TX 报文已由 rawDataInout 节流后按秒合并输出）
 }
 
 // RGB 图像捕获相关槽
@@ -737,10 +836,10 @@ void MainWindow::onRecordStopped(const QString &filePath)
     ui->rgbBtnSelectVideoPath->setEnabled(true);
     qDebug() << "[MainWindow] 录像已完成，文件:" << filePath;
     
-    // 停止 PTZ 自动查询
-    if (m_ptzController) {
-        emit ptzStopAutoQuery();
-        qDebug() << "[MainWindow] PTZ 自动查询已停止";
+    // 恢复角度自动查询（空闲 5Hz）：录像结束后角度反馈仍需保持更新
+    if (m_ptzController && m_ptzConnected) {
+        emit ptzStartAutoQuery(200);
+        qDebug() << "[MainWindow] PTZ 自动查询已恢复 (5Hz)";
     }
     
     // 显示数据记录文件信息
@@ -785,6 +884,8 @@ void MainWindow::onConnectionStatusChanged(bool connected)
             connect(this, &MainWindow::ptzMoveTo, m_ptzController, &IPtzController::moveTo);
             connect(this, &MainWindow::ptzStop, m_ptzController, &IPtzController::stop);
             connect(this, &MainWindow::ptzQueryAngle, m_ptzController, &IPtzController::queryAngle);
+            connect(this, &MainWindow::ptzCallPreset, m_ptzController, &IPtzController::callPreset);
+            connect(this, &MainWindow::ptzSetPreset, m_ptzController, &IPtzController::setPreset);
             connect(this, &MainWindow::ptzMoveDirection, m_ptzController, &IPtzController::moveDirection);
             connect(this, &MainWindow::ptzStartAutoQuery, m_ptzController, &IPtzController::startAutoQuery);
             connect(this, &MainWindow::ptzStopAutoQuery, m_ptzController, &IPtzController::stopAutoQuery);
@@ -792,11 +893,25 @@ void MainWindow::onConnectionStatusChanged(bool connected)
             connect(m_ptzController, &IPtzController::angleReceived, m_deviceManager, &DeviceManager::onPTZAngleReceived);
 
             connect(m_ptzController, &IPtzController::rawDataInout, this, [this](bool isTx, QByteArray data){
-                QString hexStr = data.toHex(' ').toUpper();
-                if (isTx) {
-                    ui->textLog->append(QString("<font color='#0055FF'><b>[TX]</b> %1</font>").arg(hexStr));
-                } else {
-                    ui->textLog->append(QString("<font color='#008000'><b>[RX]</b> %1</font>").arg(hexStr));
+                // 高频报文日志节流：角度轮询 10Hz + 运动指令会瞬时产生大量追加，
+                // QTextEdit 逐条 append（含 HTML 解析）会拖垮 UI 线程。
+                // 改为缓存合并，1s 最多刷一次，且合并后只有一行
+                static QStringList s_buffer;
+                static QElapsedTimer s_flushTimer;
+                static bool s_init = false;
+                if (!s_init) {
+                    s_flushTimer.start();
+                    s_init = true;
+                }
+                s_buffer << QString("%1 %2").arg(isTx ? "[TX]" : "[RX]",
+                                                QString::fromLatin1(data.toHex(' ').toUpper()));
+                if (s_buffer.size() > 50) {
+                    s_buffer.removeFirst();  // 兜底：极端高频时丢最旧，防缓冲无限增长
+                }
+                if (s_flushTimer.elapsed() >= 1000) {
+                    ui->textLog->append(s_buffer.join("<br>"));
+                    s_buffer.clear();
+                    s_flushTimer.restart();
                 }
             });
 
@@ -805,11 +920,11 @@ void MainWindow::onConnectionStatusChanged(bool connected)
 
             m_ptzConnected = true;
             updatePTZUIState();
-            emit ptzStartAutoQuery(100);
+            emit ptzStartAutoQuery(200);
             ui->textLog->append("[云台] 以太网一体化网络云台已就绪");
         }
 
-        m_tempPollTimer->start(1000);
+        if (m_tempOsdEnabled) m_tempPollTimer->start(5000);
     } else {
         qInfo() << "[MainWindow] 设备断开连接，停止视频预览与云台会话";
         m_tempPollTimer->stop();
@@ -1270,8 +1385,9 @@ void MainWindow::onGlobalTempUpdated(float maxTemp, float minTemp)
 void MainWindow::onTempPollTimeout()
 {
     if (m_deviceManager && m_deviceManager->isConnected()) {
-        float maxT = 0.0f, minT = 0.0f;
-        m_deviceManager->getInfraredService()->queryGlobalMaxMinTemp(maxT, minT);
+        // 异步执行：SDK 测温是阻塞网络调用，不能在 UI 线程同步轮询（会造成周期性 UI 卡顿），
+        // 结果经 globalTempUpdated 信号（自动队列连接）回到 UI 线程更新
+        m_deviceManager->getInfraredService()->requestGlobalMaxMinTemp();
     }
 }
 

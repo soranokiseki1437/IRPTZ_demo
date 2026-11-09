@@ -41,6 +41,7 @@ private slots:
     void on_btnStop_clicked();
     void on_btnQuery_clicked();
     void on_btnReset_clicked();
+    void on_btnSetHome_clicked();
     void handleAngleReceived(float pan, float tilt, float panSpeed, float tiltSpeed);
     
     // RGB 图像捕获相关槽
@@ -87,6 +88,8 @@ signals:
     void ptzMoveTo(float pan, float tilt, float speed);
     void ptzStop();
     void ptzQueryAngle();
+    void ptzCallPreset(uint8_t presetId);
+    void ptzSetPreset(uint8_t presetId);
     void ptzMoveDirection(uint8_t cmd2, uint8_t hSpeed, uint8_t vSpeed);
     void ptzStartAutoQuery(int intervalMs);
     void ptzStopAutoQuery();
@@ -131,6 +134,7 @@ private:
     float m_globalMaxTemp = 0.0f;
     float m_globalMinTemp = 0.0f;
     bool m_tempOsdEnabled = true;
+    bool m_tempPollPaused = false; // 手动操作云台期间暂停测温轮询，松开后恢复
 
     // 方向盘按住期间的周期重发（周期需小于 PTZController 的 500ms 失联看门狗）
     QTimer *m_ptzManualRepeatTimer;

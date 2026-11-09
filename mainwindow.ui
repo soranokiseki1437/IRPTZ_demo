@@ -739,6 +739,13 @@
                </property>
               </widget>
              </item>
+             <item row="3" column="0" colspan="4">
+              <widget class="QPushButton" name="btnSetHome">
+               <property name="text">
+                <string>把当前位置设为复位点</string>
+               </property>
+              </widget>
+             </item>
             </layout>
            </item>
           </layout>
@@ -1096,7 +1103,7 @@
               <string>温度显示</string>
              </property>
              <property name="checked">
-              <bool>true</bool>
+              <bool>false</bool>
              </property>
             </widget>
            </item>

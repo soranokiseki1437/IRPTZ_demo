@@ -35,6 +35,9 @@ DeviceManager::DeviceManager(QObject *parent)
 
 DeviceManager::~DeviceManager()
 {
+    // 析构阶段不再向外部发信号：此时接收方（MainWindow）的派生部分可能已析构，
+    // Qt 会以 "Called object is not of the correct type" 断言崩溃
+    disconnect(this, nullptr, nullptr, nullptr);
     logout();
     if (instance == this) {
         instance = nullptr;

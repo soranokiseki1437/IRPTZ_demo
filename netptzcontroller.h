@@ -68,10 +68,12 @@ private:
     int m_maxSdkSpeed = 63;
     AngleDecodeMode m_decodeMode = AngleDecodeMode::DeciDegree;
     int m_queryFailCount = 0;
+    int m_zeroPosCount = 0; // 位置回读连续全 0 计数，用于判定设备是否支持角度回读
     bool m_angleSupported = true;
 
     QTimer *m_autoQueryTimer = nullptr;
     QTimer *m_stopWatchdog = nullptr;
+    QElapsedTimer m_watchdogStamp; // 最近一次运动指令生效时刻，用于丢弃过期看门狗事件
     std::atomic<bool> m_autoQuerying{false};
 };
 

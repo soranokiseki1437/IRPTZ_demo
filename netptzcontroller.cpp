@@ -1,6 +1,7 @@
 #include "netptzcontroller.h"
 #include <QtMath>
 #include <QDebug>
+#include <QElapsedTimer>
 #include <cstring>
 
 NetPtzController::NetPtzController(SvSdkSession *session, LONG channel, QObject *parent)
@@ -117,6 +118,7 @@ void NetPtzController::moveDirection(uint8_t cmd2, uint8_t hSpeed, uint8_t vSpee
 
     // 每次收到有效运动指令，刷新 500ms 失联保护看门狗
     m_stopWatchdog->start(500);
+    m_watchdogStamp.restart();
 
     uint8_t rawSpeed = qMax(hSpeed, vSpeed);
     if (rawSpeed == 0) rawSpeed = 30;
@@ -127,7 +129,17 @@ void NetPtzController::moveDirection(uint8_t cmd2, uint8_t hSpeed, uint8_t vSpee
         return;
     }
 
+    // 排障：量化运动指令 SDK 调用耗时（阻塞网络调用会推迟同线程上排队的后续指令/停止指令）
+    QElapsedTimer sdkTimer;
+    sdkTimer.start();
     sendSdkPtz(dwCommand, 0, dwSpeed);
+    if (sdkTimer.elapsed() > 200) {
+        qWarning() << "[NetPtzController] 运动指令 SDK 调用耗时:" << sdkTimer.elapsed()
+                   << "ms cmd =" << dwCommand << "speed =" << dwSpeed;
+    }
+    // 阻塞调用返回后重新计时：SDK 阻塞期间早已到期的超时事件不能在恢复瞬间补发急停
+    m_watchdogStamp.restart();
+    m_stopWatchdog->start(500);
     m_lastCmd = dwCommand;
     m_lastSpeed = dwSpeed;
     m_isMoving = true;
@@ -136,13 +148,20 @@ void NetPtzController::moveDirection(uint8_t cmd2, uint8_t hSpeed, uint8_t vSpee
 void NetPtzController::stop()
 {
     m_stopWatchdog->stop();
+    m_watchdogStamp.invalidate();
     if (!isOpen()) {
         m_isMoving = false;
         m_lastCmd = 0;
         m_lastSpeed = 0;
         return;
     }
+    // 排障：停止指令耗时尤其关键——松开按钮后若此调用阻塞，云台会过冲，体感就是"延迟"
+    QElapsedTimer sdkTimer;
+    sdkTimer.start();
     sendSdkPtz(m_lastCmd, 1, 0);
+    if (sdkTimer.elapsed() > 200) {
+        qWarning() << "[NetPtzController] 停止指令 SDK 调用耗时:" << sdkTimer.elapsed() << "ms";
+    }
     m_isMoving = false;
     m_lastCmd = 0;
     m_lastSpeed = 0;
@@ -150,13 +169,28 @@ void NetPtzController::stop()
 
 void NetPtzController::onStopWatchdogTimeout()
 {
-    qWarning() << "[NetPtzController] 500ms 未收到后续运动指令，看门狗触发自动急停";
+    if (!m_isMoving) return; // 已处于停止态，忽略残留的超时事件
+    // SDK 阻塞期间到期的超时事件会在事件循环恢复瞬间补发，此时指令刚下发，
+    // 不应立即急停；只有距上次有效运动指令确实超过判定窗口才执行
+    if (m_watchdogStamp.isValid() && m_watchdogStamp.elapsed() < 400) {
+        qDebug() << "[NetPtzController] 忽略过期的看门狗超时事件, 距上次指令"
+                 << m_watchdogStamp.elapsed() << "ms";
+        return;
+    }
+    qWarning() << "[NetPtzController] 500ms 未收到后续运动指令，看门狗触发自动急停"
+               << " cmd =" << m_lastCmd << " moving =" << m_isMoving;
     stop();
 }
 
 void NetPtzController::moveTo(float pan, float tilt, float /*speed*/)
 {
-    if (!isOpen() || !m_angleSupported) return;
+    if (!isOpen()) return;
+
+    // SV_NET_DEV_SetPtzPosition 是"场景坐标配置"接口（结构体含场景名称/使能位），
+    // 只写配置不会驱动云台，必须再对该场景号调用 RUN_PRESET 才会运动。
+    // 场景号 2 用于"移动"按钮的绝对定位，避免覆盖复位点所用的预置位 1
+    const int sceneId = 2;
+
     SV_NET_DEV_PTZ_POSITION pos{};
     pos.byEnable = 1;
     pos.struPtzPos.wAction = 1;
@@ -166,19 +200,53 @@ void NetPtzController::moveTo(float pan, float tilt, float /*speed*/)
     float normTilt = (tilt < 0) ? (360.0f + tilt) : tilt;
     pos.struPtzPos.wPanPos  = static_cast<WORD>(qRound(normPan * scale));
     pos.struPtzPos.wTiltPos = static_cast<WORD>(qRound(normTilt * scale));
-    SV_NET_DEV_SetPtzPosition(m_session->userId(), m_channel, 0, &pos);
+
+    const LONG cfgRet = SV_NET_DEV_SetPtzPosition(m_session->userId(), m_channel, sceneId, &pos);
+    if (cfgRet < 0) {
+        qWarning() << "[NetPtzController] 配置定位场景失败 ret =" << cfgRet
+                   << " SDK err =" << SV_NET_DEV_GetLastError()
+                   << " pan =" << pan << "tilt =" << tilt;
+        return;
+    }
+
+    const LONG runRet = SV_NET_DEV_PTZPreset_EX(m_session->userId(), m_channel,
+                                                RUN_PRESET, sceneId);
+    if (runRet < 0) {
+        qWarning() << "[NetPtzController] 调用定位场景失败 ret =" << runRet
+                   << " SDK err =" << SV_NET_DEV_GetLastError()
+                   << " scene =" << sceneId;
+    } else {
+        qInfo() << "[NetPtzController] 已下发定位请求 pan =" << pan << "tilt =" << tilt
+                << " raw pan =" << pos.struPtzPos.wPanPos
+                << " raw tilt =" << pos.struPtzPos.wTiltPos
+                << " scene =" << sceneId;
+    }
 }
 
 void NetPtzController::callPreset(uint8_t presetId)
 {
     if (!isOpen()) return;
-    SV_NET_DEV_PTZPreset_EX(m_session->userId(), m_channel, RUN_PRESET, presetId);
+    const LONG ret = SV_NET_DEV_PTZPreset_EX(m_session->userId(), m_channel,
+                                             RUN_PRESET, presetId);
+    if (ret < 0) {
+        qWarning() << "[NetPtzController] 调用预置位失败 preset =" << presetId
+                   << " ret =" << ret << " SDK err =" << SV_NET_DEV_GetLastError();
+    } else {
+        qInfo() << "[NetPtzController] 已调用预置位 preset =" << presetId;
+    }
 }
 
 void NetPtzController::setPreset(uint8_t presetId)
 {
     if (!isOpen()) return;
-    SV_NET_DEV_PTZPreset_EX(m_session->userId(), m_channel, SET_PRESET, presetId);
+    const LONG ret = SV_NET_DEV_PTZPreset_EX(m_session->userId(), m_channel,
+                                             SET_PRESET, presetId);
+    if (ret < 0) {
+        qWarning() << "[NetPtzController] 保存预置位失败 preset =" << presetId
+                   << " ret =" << ret << " SDK err =" << SV_NET_DEV_GetLastError();
+    } else {
+        qInfo() << "[NetPtzController] 已把当前位置保存为预置位 preset =" << presetId;
+    }
 }
 
 float NetPtzController::decodeRawAngle(WORD raw, bool isTilt) const
@@ -205,8 +273,43 @@ void NetPtzController::queryAngle()
 {
     if (!isOpen() || !m_angleSupported) return;
 
+    // 运动期间跳过角度查询：GetPtzPosition 与运动/停止指令串行执行，
+    // 任何一次查询都会排在用户指令之前，是操作手感延迟的直接来源
+    if (m_isMoving) return;
+
+    // 排障：量化角度查询耗时。SV_NET_DEV_GetPtzPosition 是阻塞网络调用，
+    // 与运动指令同在本线程事件循环内串行——查询耗时会直接推迟 moveDirection/stop 执行
+    static QElapsedTimer s_statsTimer;
+    static qint64 s_totalMs = 0;
+    static int s_count = 0;
+    static qint64 s_maxMs = 0;
+    static bool s_statsInit = false;
+    if (!s_statsInit) {
+        s_statsTimer.start();
+        s_statsInit = true;
+    }
+    QElapsedTimer callTimer;
+    callTimer.start();
+
     SV_NET_DEV_PTZ_POSITION pos{};
     LONG ret = SV_NET_DEV_GetPtzPosition(m_session->userId(), m_channel, 0, &pos);
+
+    const qint64 callMs = callTimer.elapsed();
+    s_totalMs += callMs;
+    ++s_count;
+    s_maxMs = qMax(s_maxMs, callMs);
+    if (s_statsTimer.elapsed() >= 5000) {
+        if (s_count > 0) {
+            qInfo() << "[NetPtzController] 5s 角度查询: 次数 =" << s_count
+                    << " 平均耗时 =" << (s_totalMs / s_count) << "ms"
+                    << " 最大耗时 =" << s_maxMs << "ms";
+        }
+        s_totalMs = 0;
+        s_count = 0;
+        s_maxMs = 0;
+        s_statsTimer.restart();
+    }
+
     if (ret < 0) {
         if (++m_queryFailCount >= 10) {
             m_angleSupported = false;
@@ -223,7 +326,21 @@ void NetPtzController::queryAngle()
     rxPkt.append(static_cast<char>((pos.struPtzPos.wPanPos >> 8) & 0xFF));
     rxPkt.append(static_cast<char>(pos.struPtzPos.wTiltPos & 0xFF));
     rxPkt.append(static_cast<char>((pos.struPtzPos.wTiltPos >> 8) & 0xFF));
-    emit rawDataInout(false, rxPkt);
+    // 仅在数据变化时回显：该设备位置回读恒为全 0，逐次回显只会刷屏 "00 00 00 00"
+    static QByteArray s_lastRawPkt;
+    if (rxPkt != s_lastRawPkt) {
+        s_lastRawPkt = rxPkt;
+        emit rawDataInout(false, rxPkt);
+    }
+    // 连续全 0 说明设备不支持当前位置回读（GetPtzPosition 读的是场景坐标，非实时角度）
+    if (pos.struPtzPos.wPanPos == 0 && pos.struPtzPos.wTiltPos == 0) {
+        if (++m_zeroPosCount == 25) {
+            qWarning() << "[NetPtzController] 位置回读连续返回全 0，"
+                          "该设备可能不支持实时角度查询，角度显示不可用";
+        }
+    } else {
+        m_zeroPosCount = 0;
+    }
 
     float newPan  = decodeRawAngle(pos.struPtzPos.wPanPos, false);
     float newTilt = decodeRawAngle(pos.struPtzPos.wTiltPos, true);

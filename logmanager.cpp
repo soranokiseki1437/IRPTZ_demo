@@ -100,6 +100,8 @@ void LogManager::startLogging(const QString& logDir)
     }
 
     m_rotateIndex = 0;
+    // 每次运行生成独立日志文件：log_yyyyMMdd_HHmmss.log
+    m_runStamp = QDateTime::currentDateTime().toString("yyyyMMdd_HHmmss");
     if (!openLogFile()) {
         return;
     }
@@ -251,11 +253,10 @@ bool LogManager::openLogFile()
 
 bool LogManager::openFileLocked()
 {
-    // 按天命名：yyyyMMdd.log（轮转文件名带序号）
-    const QString date = QDateTime::currentDateTime().toString("yyyyMMdd");
+    // 每次运行独立命名：log_yyyyMMdd_HHmmss.log（超限轮转文件名带序号）
     const QString fileName = (m_rotateIndex == 0)
-        ? QString("%1.log").arg(date)
-        : QString("%1_%2.log").arg(date).arg(m_rotateIndex);
+        ? QString("log_%1.log").arg(m_runStamp)
+        : QString("log_%1_%2.log").arg(m_runStamp).arg(m_rotateIndex);
     m_currentLogFile = QDir(m_logDir).filePath(fileName);
 
     m_logFile.setFileName(m_currentLogFile);

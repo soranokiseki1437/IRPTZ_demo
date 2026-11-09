@@ -56,6 +56,7 @@ private:
     std::atomic<bool> m_running{false};
     int m_droppedLines = 0;
     int m_rotateIndex = 0;
+    QString m_runStamp;          // 本次运行的时间戳（文件名用，轮转时保持不变）
     QString m_logDir;
     QString m_currentLogFile;
 };

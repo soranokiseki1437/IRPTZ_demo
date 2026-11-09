@@ -2,6 +2,9 @@
 #include <QFile>
 #include <QVector>
 #include <QDebug>
+#include <QElapsedTimer>
+#include <QPointer>
+#include <QtConcurrent/QtConcurrentRun>
 
 InfraredService::InfraredService(SvSdkSession *session, QObject *parent)
     : QObject(parent), m_session(session) {}
@@ -76,6 +79,39 @@ bool InfraredService::queryGlobalMaxMinTemp(float &maxTemp, float &minTemp)
         return true;
     }
     return false;
+}
+
+// 异步版：SDK 测温调用是阻塞网络请求，绝不能放在 UI 线程轮询（云台运动时调用变慢，
+// 会把 UI 线程周期性卡住，表现为整体操作卡顿、PTZ 看门狗误触发急停）
+void InfraredService::requestGlobalMaxMinTemp()
+{
+    if (!m_session || !m_session->isLoggedIn()) return;
+
+    // 单飞：上一请求未返回时直接丢弃本次轮询。
+    // 设备侧单次测温约 3s，若按 1Hz 无脑投递，请求会在 SDK 队列中无限堆积，
+    // 最终把云台运动/停止指令一起堵住（现场实测运动指令阻塞 30968ms）
+    bool expected = false;
+    if (!m_tempQueryInFlight.compare_exchange_strong(expected, true)) {
+        return;
+    }
+
+    const LONG uid = m_session->userId();
+    QPointer<InfraredService> guard(this);
+    (void)QtConcurrent::run([guard, uid]() {
+        QElapsedTimer t;
+        t.start();
+        float retTemp[4] = {0.0f};
+        const LONG ret = SV_NET_DEV_GetThmlMtFSMaxMinVal(uid, retTemp);
+        const qint64 costMs = t.elapsed();
+        if (!guard) return; // 服务已销毁，不再访问成员
+        guard->m_tempQueryInFlight.store(false); // 所有返回路径都必须复位
+        if (costMs > 500) {
+            qWarning() << "[InfraredService] 测温单次耗时:" << costMs << "ms ret =" << ret;
+        }
+        if (ret == 0) { // 0 为成功
+            emit guard->globalTempUpdated(retTemp[0], retTemp[1]);
+        }
+    });
 }
 
 bool InfraredService::queryPointTemp(const QPoint &pt, float &tempOut)
