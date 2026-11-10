@@ -17,7 +17,7 @@ CaptureManager::CaptureManager(QObject *parent)
     , m_imageProcessor(nullptr)
     , m_timer(new QTimer(this))
     , m_captureInterval(5)
-    , m_quality(80)
+    , m_quality(1)
     , m_width(1920)
     , m_height(1080)
     , m_processWatcher(new QFutureWatcher<ProcessResult>(this))
@@ -92,30 +92,36 @@ bool CaptureManager::captureOnce(uint8_t quality, uint16_t width, uint16_t heigh
     
     LONG userID = static_cast<LONG>(m_deviceManager->getUserID());
     SV_NET_DEV_JPEGPARA jpegPara{};
-    jpegPara.wPicQuality = (quality > 0) ? quality : 80;
-    jpegPara.wPicSize = 0; // 默认原图分辨率
+    // SDK 定义：wPicQuality 0=最好、1=较好、2=一般、0xFF=自动；
+    // wPicSize 0=CIF、0xFF=自动（使用当前码流原始分辨率）。
+    // 旧代码直接传 UI 的 1~100 且 wPicSize=0，导致设备按异常值强压缩并输出 CIF/低分辨率。
+    const WORD sdkQuality = static_cast<WORD>(qBound(0, static_cast<int>(quality), 2));
+    jpegPara.wPicQuality = sdkQuality;
+    jpegPara.wPicSize = 0xFF;
 
     QVector<char> jpegBuffer(4 * 1024 * 1024, 0);
     int sizeReturned = 0;
     LONG ret = SV_NET_DEV_CaptureJPEGPicture_V13(userID, 0, &jpegPara, jpegBuffer.data(), &sizeReturned);
-    if (ret == 0 && sizeReturned > 0) {
+    if (ret == 0 && sizeReturned > 0 && sizeReturned <= jpegBuffer.size()) {
         QByteArray safeData(jpegBuffer.constData(), sizeReturned);
         emit rawSnapDataReceived(safeData, m_savePath);
-        qInfo() << "[CaptureManager] 硬件直出 JPEG 抓图成功, 字节数:" << sizeReturned;
+        qInfo() << "[CaptureManager] 硬件直出 JPEG 抓图成功, 质量档:" << sdkQuality
+                << " 字节数:" << sizeReturned;
         return true;
     }
 
     // 备用方式：直接抓取 JPEG
     ret = SV_NET_DEV_CaptureJPEGPicture(userID, 0, &jpegPara, jpegBuffer.data());
-    if (ret >= 0) {
-        // 如果返回长度在 para 中或者已知
-        QByteArray safeData(jpegBuffer.constData(), (sizeReturned > 0 ? sizeReturned : 1024 * 1024));
+    if (ret >= 0 && sizeReturned > 0 && sizeReturned <= jpegBuffer.size()) {
+        QByteArray safeData(jpegBuffer.constData(), sizeReturned);
         emit rawSnapDataReceived(safeData, m_savePath);
+        qInfo() << "[CaptureManager] JPEG 抓图成功(备用接口), 质量档:" << sdkQuality
+                << " 字节数:" << sizeReturned;
         return true;
     }
 
     LONG err = SV_NET_DEV_GetLastError();
-    emit errorOccurred(QString("抓拍失败, 错误码=%1").arg(err));
+    emit errorOccurred(QString("抓拍失败, 错误码=%1, 返回长度=%2").arg(err).arg(sizeReturned));
     return false;
 }
 
@@ -174,21 +180,22 @@ void CaptureManager::onImageProcessed()
     }
 }
 
-bool CaptureManager::startTimedCapture(int interval, uint8_t quality, uint16_t width, uint16_t height)
+bool CaptureManager::startTimedCapture(int intervalSeconds, uint8_t quality, uint16_t width, uint16_t height)
 {
     QMutexLocker locker(&m_mutex);
     
-    if (interval <= 0) {
+    if (intervalSeconds <= 0) {
         emit errorOccurred("定时间隔必须大于0");
         return false;
     }
     
-    m_captureInterval = interval;
+    m_captureInterval = intervalSeconds;
     m_quality = quality;
     m_width = width;
     m_height = height;
     
-    m_timer->setInterval(interval * 1000);
+    // 入参单位为秒；此处统一换算为毫秒（调用方不要再乘 1000）
+    m_timer->setInterval(intervalSeconds * 1000);
     m_timer->start();
     
     return true;

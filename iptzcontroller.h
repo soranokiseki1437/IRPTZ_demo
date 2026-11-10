@@ -26,7 +26,6 @@ public:
 
 public slots:
     virtual void init() = 0;
-    virtual void moveTo(float pan, float tilt, float speed = 0.5f) = 0;
     virtual void stop() = 0;
     virtual void queryAngle() = 0;
     virtual void moveDirection(uint8_t cmd2, uint8_t hSpeed, uint8_t vSpeed) = 0;

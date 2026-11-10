@@ -35,7 +35,8 @@ public:
 
 public slots:
     bool captureOnce(uint8_t quality, uint16_t width, uint16_t height);
-    bool startTimedCapture(int interval, uint8_t quality, uint16_t width, uint16_t height);
+    // intervalSeconds: 定时抓图间隔（秒），内部统一换算为毫秒
+    bool startTimedCapture(int intervalSeconds, uint8_t quality, uint16_t width, uint16_t height);
     void stopTimedCapture();
 
 public:

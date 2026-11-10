@@ -9,6 +9,10 @@
 #include <QMouseEvent>
 #include <QPainter>
 #include <QElapsedTimer>
+#include <QAction>
+#include <QFileInfo>
+#include <QCloseEvent>
+#include "taskboardwindow.h"
 
 #include <memory>
 
@@ -74,10 +78,15 @@ MainWindow::MainWindow(QWidget *parent) : QMainWindow(parent)
     connect(m_deviceManager, &DeviceManager::errorOccurred, this, &MainWindow::onErrorOccurred);
     connect(m_deviceManager, &DeviceManager::frameReceived, this, &MainWindow::onFrameReceived);
     connect(m_deviceManager, &DeviceManager::streamStarted, this, [this](bool ok){
-        if (!ok) ui->statusbar->showMessage("开启视频预览失败", 3000);
+        if (!ok) {
+            ui->statusbar->showMessage("开启视频预览失败", 3000);
+            if (m_fpsLabel) m_fpsLabel->hide();
+            m_fpsFrameCount = 0;
+        }
     });
     connect(m_deviceManager, &DeviceManager::recordStarted, this, &MainWindow::onRecordStarted);
     connect(m_deviceManager, &DeviceManager::recordStopped, this, &MainWindow::onRecordStopped);
+    connect(m_deviceManager, &DeviceManager::recordFailed, this, &MainWindow::onRecordFailed);
     connect(m_captureManager, &CaptureManager::captureFinished, this, &MainWindow::onCaptureFinished);
     connect(m_captureManager, &CaptureManager::errorOccurred, this, &MainWindow::onErrorOccurred);
     connect(m_imageProcessor, &ImageProcessor::errorOccurred, this, &MainWindow::onErrorOccurred);
@@ -119,7 +128,11 @@ MainWindow::MainWindow(QWidget *parent) : QMainWindow(parent)
 
     const auto bindDirection = [this](QPushButton *btn, uint8_t cmd2, int dirX, int dirY) {
         connect(btn, &QPushButton::pressed, this, [this, cmd2, dirX, dirY]() {
-            const uint8_t spd = static_cast<uint8_t>(ui->spinSpeed->value() * 63);
+            // 方向键操作打断自动巡航，避免两套运动逻辑打架
+            if (m_autoCruiseActive) {
+                stopAutoCruise();
+            }
+            const uint8_t spd = levelToRawSpeed(ui->spinSpeed->value());
             startManualMove(cmd2,
                             static_cast<uint8_t>(dirX ? spd : 0),
                             static_cast<uint8_t>(dirY ? spd : 0));
@@ -138,6 +151,21 @@ MainWindow::MainWindow(QWidget *parent) : QMainWindow(parent)
 
     // 方向盘中心"停止"按钮：立即停止云台并终止周期重发
     connect(ui->stop, &QPushButton::clicked, this, &MainWindow::stopManualMove);
+
+    // 速度档位变化：按住方向键或巡航期间立即生效，无需松开
+    connect(ui->spinSpeed, &QDoubleSpinBox::valueChanged, this, [this](double) {
+        updateManualMoveSpeed();
+    });
+
+    // 自动巡航
+    m_cruiseEndTimer = new QTimer(this);
+    m_cruiseEndTimer->setSingleShot(true);
+    connect(m_cruiseEndTimer, &QTimer::timeout, this, &MainWindow::onCruiseEndTimeout);
+    m_cruiseTickTimer = new QTimer(this);
+    m_cruiseTickTimer->setInterval(1000);
+    connect(m_cruiseTickTimer, &QTimer::timeout, this, &MainWindow::onCruiseTick);
+    connect(ui->btnCruiseStart, &QPushButton::clicked, this, &MainWindow::startAutoCruise);
+    connect(ui->btnCruiseStop, &QPushButton::clicked, this, &MainWindow::stopAutoCruise);
     
     // === 镜头控制按钮绑定 ===
     // 【关键】镜头控制按钮禁用 autoRepeat！
@@ -146,8 +174,6 @@ MainWindow::MainWindow(QWidget *parent) : QMainWindow(parent)
     if (ui->btnZoomOut) ui->btnZoomOut->setAutoRepeat(false);
     if (ui->btnFocusNear) ui->btnFocusNear->setAutoRepeat(false);
     if (ui->btnFocusFar) ui->btnFocusFar->setAutoRepeat(false);
-    if (ui->btnIrisOpen) ui->btnIrisOpen->setAutoRepeat(false);
-    if (ui->btnIrisClose) ui->btnIrisClose->setAutoRepeat(false);
     
     // 变倍+
     if (ui->btnZoomIn) {
@@ -196,42 +222,6 @@ MainWindow::MainWindow(QWidget *parent) : QMainWindow(parent)
             m_deviceManager->getLensManager()->focusFar(speed, true);
         });
     }
-    
-    // 光圈大
-    if (ui->btnIrisOpen) {
-        connect(ui->btnIrisOpen, &QPushButton::pressed, this, [this]() {
-            uint8_t speed = static_cast<uint8_t>(ui->spinLensSpeed->value());
-            m_deviceManager->getLensManager()->irisOpen(speed, false);
-        });
-        connect(ui->btnIrisOpen, &QPushButton::released, this, [this]() {
-            uint8_t speed = static_cast<uint8_t>(ui->spinLensSpeed->value());
-            m_deviceManager->getLensManager()->irisOpen(speed, true);
-        });
-    }
-    
-    // 光圈小
-    if (ui->btnIrisClose) {
-        connect(ui->btnIrisClose, &QPushButton::pressed, this, [this]() {
-            uint8_t speed = static_cast<uint8_t>(ui->spinLensSpeed->value());
-            m_deviceManager->getLensManager()->irisClose(speed, false);
-        });
-        connect(ui->btnIrisClose, &QPushButton::released, this, [this]() {
-            uint8_t speed = static_cast<uint8_t>(ui->spinLensSpeed->value());
-            m_deviceManager->getLensManager()->irisClose(speed, true);
-        });
-    }
-    
-    // 聚焦模式切换
-    if (ui->checkBoxManualFocus) {
-        connect(ui->checkBoxManualFocus, &QCheckBox::clicked, this, &MainWindow::on_checkBoxManualFocus_clicked);
-        connect(m_deviceManager->getLensManager(), &LensManager::focusModeChanged, this, &MainWindow::onFocusModeChanged);
-    }
-    
-    // 光圈模式切换
-    if (ui->checkBoxManualIris) {
-        connect(ui->checkBoxManualIris, &QCheckBox::clicked, this, &MainWindow::on_checkBoxManualIris_clicked);
-        connect(m_deviceManager->getLensManager(), &LensManager::irisModeChanged, this, &MainWindow::onIrisModeChanged);
-    }
 }
 
 MainWindow::~MainWindow()
@@ -263,6 +253,27 @@ void MainWindow::initUI()
 
     // 初始化目标跟踪模块
     initTrackingModule();
+
+    // 画面右下角实时帧率叠层：作为视频 QLabel 的子控件，不画进 QPixmap，
+    // 避免每帧触发 pixmap 深拷贝
+    m_fpsLabel = new QLabel(ui->rgbLabelImage);
+    m_fpsLabel->setAttribute(Qt::WA_TransparentForMouseEvents);
+    m_fpsLabel->setStyleSheet("QLabel { background-color: rgba(0, 0, 0, 170); color: #00FF66;"
+                              " font-family: Consolas, 'Microsoft YaHei', monospace;"
+                              " font-size: 14px; font-weight: bold;"
+                              " padding: 2px 6px; border-radius: 3px; }");
+    m_fpsLabel->setText("FPS --");
+    m_fpsLabel->adjustSize();
+    m_fpsLabel->hide();
+    m_fpsTimer.start();
+
+    // 码流信息（编码格式/分辨率/帧率）由 RTSP 源上报
+    connect(m_deviceManager, &DeviceManager::streamInfo, this, [this](const QString &info) {
+        m_streamInfo = info;
+    });
+
+    // 菜单：长任务看板
+    connect(ui->actionTaskBoard, &QAction::triggered, this, &MainWindow::showTaskBoard);
 
     // 图像调节与校准控件连接
     m_tempOsdEnabled = (ui->checkOSD->checkState() == Qt::Checked);
@@ -313,6 +324,7 @@ void MainWindow::initRGBModule()
     ui->spinBoxInterval->setValue(m_configManager->getCaptureInterval());
     ui->spinBoxQuality->setValue(m_configManager->getCaptureQuality());
     ui->lineEditSavePath->setText(m_configManager->getSavePath());
+    ui->lineEditVideoSavePath->setText(m_configManager->getVideoSavePath());
 
     // 设置保存路径
     m_captureManager->setSavePath(m_configManager->getSavePath());
@@ -323,26 +335,7 @@ void MainWindow::initRGBModule()
     if (ui->btnZoomOut) ui->btnZoomOut->setEnabled(false);
     if (ui->btnFocusNear) ui->btnFocusNear->setEnabled(false);
     if (ui->btnFocusFar) ui->btnFocusFar->setEnabled(false);
-    if (ui->btnIrisOpen) ui->btnIrisOpen->setEnabled(false);
-    if (ui->btnIrisClose) ui->btnIrisClose->setEnabled(false);
     if (ui->spinLensSpeed) ui->spinLensSpeed->setEnabled(false);
-
-    // 设备/厂家 SDK 只提供 46~49（变倍、聚焦）与 53（自动聚焦，设备返回 err=10 不支持），
-    // 没有光圈命令。光圈相关控件无实际命令可下发，直接禁用并说明，避免出现"点了没反应"的按钮
-    const QString irisTip = "厂家 SDK 未提供光圈控制命令，该设备光圈不可远程调节";
-    if (ui->btnIrisOpen) ui->btnIrisOpen->setToolTip(irisTip);
-    if (ui->btnIrisClose) ui->btnIrisClose->setToolTip(irisTip);
-    if (ui->checkBoxManualIris) {
-        ui->checkBoxManualIris->setChecked(false);
-        ui->checkBoxManualIris->setEnabled(false);
-        ui->checkBoxManualIris->setToolTip(irisTip);
-    }
-    // 自动聚焦命令(53)设备不支持，镜头固定为手动对焦：复选框常选中并禁用
-    if (ui->checkBoxManualFocus) {
-        ui->checkBoxManualFocus->setChecked(true);
-        ui->checkBoxManualFocus->setEnabled(false);
-        ui->checkBoxManualFocus->setToolTip("设备不支持自动聚焦，镜头始终为手动对焦");
-    }
 }
 
 void MainWindow::initTrackingModule()
@@ -405,13 +398,10 @@ void MainWindow::updateTrackingUIState()
 
 void MainWindow::updatePTZUIState()
 {
-    ui->btnMove->setEnabled(m_ptzConnected);
     ui->btnStop->setEnabled(m_ptzConnected);
     ui->btnQuery->setEnabled(m_ptzConnected);
     ui->btnReset->setEnabled(m_ptzConnected);
     ui->btnSetHome->setEnabled(m_ptzConnected);
-    ui->spinPan->setEnabled(m_ptzConnected);
-    ui->spinTilt->setEnabled(m_ptzConnected);
     ui->spinSpeed->setEnabled(m_ptzConnected);
     ui->groupBox_2->setEnabled(m_ptzConnected);
 }
@@ -437,12 +427,8 @@ void MainWindow::updateRGBUIState()
         if (ui->btnZoomIn) ui->btnZoomIn->setEnabled(true);
         if (ui->btnZoomOut) ui->btnZoomOut->setEnabled(true);
         if (ui->spinLensSpeed) ui->spinLensSpeed->setEnabled(true);
-        // 该设备只有手动变倍/聚焦可用：聚焦按钮直接启用；
-        // 光圈与自动聚焦厂家未提供可用命令，相关控件保持禁用（见 initRGBModule）
         if (ui->btnFocusNear) ui->btnFocusNear->setEnabled(true);
         if (ui->btnFocusFar) ui->btnFocusFar->setEnabled(true);
-        if (ui->btnIrisOpen) ui->btnIrisOpen->setEnabled(false);
-        if (ui->btnIrisClose) ui->btnIrisClose->setEnabled(false);
     } else {
         ui->rgbBtnConnect->setText("连接");
         ui->rgbLabelStatus->setText("状态: 未连接");
@@ -470,10 +456,7 @@ void MainWindow::updateRGBUIState()
         if (ui->btnZoomOut) ui->btnZoomOut->setEnabled(false);
         if (ui->btnFocusNear) ui->btnFocusNear->setEnabled(false);
         if (ui->btnFocusFar) ui->btnFocusFar->setEnabled(false);
-        if (ui->btnIrisOpen) ui->btnIrisOpen->setEnabled(false);
-        if (ui->btnIrisClose) ui->btnIrisClose->setEnabled(false);
         if (ui->spinLensSpeed) ui->spinLensSpeed->setEnabled(false);
-        if (ui->checkBoxManualFocus) ui->checkBoxManualFocus->setEnabled(false);
     }
 }
 
@@ -481,6 +464,17 @@ void MainWindow::displayImage(const QImage &image)
 {
     if (image.isNull()) {
         return;
+    }
+
+    // 实时帧率统计：1 秒窗口，标签叠在画面右下角
+    ++m_fpsFrameCount;
+    if (m_fpsTimer.elapsed() >= 1000 && m_fpsLabel) {
+        const qint64 elapsed = qMax<qint64>(1, m_fpsTimer.elapsed());
+        const double fps = m_fpsFrameCount * 1000.0 / elapsed;
+        m_fpsFrameCount = 0;
+        m_fpsTimer.restart();
+        m_fpsLabel->setText(QString("FPS %1").arg(fps, 0, 'f', 1));
+        m_fpsLabel->adjustSize();
     }
 
     // 保存最后一帧（用于框选初始化）。
@@ -514,8 +508,25 @@ void MainWindow::displayImage(const QImage &image)
         (m_tempOsdEnabled && (m_globalMaxTemp != 0.0f || m_globalMinTemp != 0.0f))
         || (m_trackBoxVisible && !m_trackBox.isEmpty() && m_scaledFrameSize.isValid());
 
-    ui->labelVideoResolution->setText(QString("分辨率: %1×%2").arg(image.width()).arg(image.height()));
+    QString resolutionText = QString("分辨率: %1×%2").arg(image.width()).arg(image.height());
+    if (!m_streamInfo.isEmpty()) {
+        resolutionText += QString(" · %1").arg(m_streamInfo);
+    }
+    ui->labelVideoResolution->setText(resolutionText);
     ui->rgbLabelImage->setPixmap(hasOverlay ? drawTrackBoxOnPixmap(m_scaledPixmap) : m_scaledPixmap);
+
+    // 把帧率标签放到实际画面（去掉黑边后）的右下角
+    if (m_fpsLabel) {
+        const QSize labelSize = ui->rgbLabelImage->size();
+        const QSize pixSize = m_scaledPixmap.size();
+        const int offsetX = qMax(0, (labelSize.width() - pixSize.width()) / 2);
+        const int offsetY = qMax(0, (labelSize.height() - pixSize.height()) / 2);
+        const int x = offsetX + pixSize.width() - m_fpsLabel->width() - 10;
+        const int y = offsetY + pixSize.height() - m_fpsLabel->height() - 10;
+        m_fpsLabel->move(qMax(10, x), qMax(10, y));
+        m_fpsLabel->raise();
+        m_fpsLabel->show();
+    }
 
     if (logPerf) {
         qInfo() << "[MainWindow] 显示链路耗时: 缩放+转QPixmap =" << scaleMs << "ms"
@@ -603,22 +614,10 @@ void MainWindow::addToHistory(const QImage & /*image*/, const QString &filePath)
 }
 
 // PTZ 控制相关槽
-void MainWindow::on_btnMove_clicked()
-{
-    if (!m_ptzController) return;
-    
-    // 获取数值
-    float pan = static_cast<float>(ui->spinPan->value());
-    float tilt = static_cast<float>(ui->spinTilt->value());
-    float speed = static_cast<float>(ui->spinSpeed->value());
-    
-    // 通过信号调用，避免跨线程直接调用
-    emit ptzMoveTo(pan, tilt, speed);
-}
-
 void MainWindow::on_btnStop_clicked()
 {
     if (!m_ptzController) return;
+    stopAutoCruise();
     emit ptzStop();
 }
 
@@ -632,6 +631,8 @@ void MainWindow::on_btnReset_clicked()
 {
     if (!m_ptzController) return;
 
+    stopAutoCruise();
+
     qDebug() << "[复位] 调用预置位 1（复位点）";
     ui->textLog->append("云台复位 -> 调用复位点（若与自检位置不一致，请先点“把当前位置设为复位点”示教）");
 
@@ -642,6 +643,8 @@ void MainWindow::on_btnReset_clicked()
 void MainWindow::on_btnSetHome_clicked()
 {
     if (!m_ptzController) return;
+
+    stopAutoCruise();
 
     qDebug() << "[复位] 把当前位置保存为预置位 1（复位点）";
     ui->textLog->append("正在保存当前位置为复位点（结果见日志）");
@@ -656,8 +659,15 @@ void MainWindow::startManualMove(uint8_t cmd2, uint8_t hSpeed, uint8_t vSpeed)
     m_ptzManualCmd2 = cmd2;
     m_ptzManualHSpeed = hSpeed;
     m_ptzManualVSpeed = vSpeed;
-    // 手动操作期间暂停测温轮询，把 SDK 控制通道让给云台指令
-    m_tempPollPaused = m_tempPollTimer->isActive();
+    // 记录按压方向，供速度变化时重算主轴/次轴速度
+    m_ptzManualDirX = ((cmd2 & 0x04) ? -1 : 0) + ((cmd2 & 0x02) ? 1 : 0);
+    m_ptzManualDirY = ((cmd2 & 0x08) ? 1 : 0) + ((cmd2 & 0x10) ? -1 : 0);
+
+    // 手动操作期间暂停测温轮询，把 SDK 控制通道让给云台指令。
+    // 仅在首次进入连续运动时记录原状态，避免变速重发覆盖暂停前的状态
+    if (!m_ptzManualRepeatTimer->isActive()) {
+        m_tempPollPaused = m_tempPollTimer->isActive();
+    }
     m_tempPollTimer->stop();
     emit ptzMoveDirection(cmd2, hSpeed, vSpeed);
     m_ptzManualRepeatTimer->start();
@@ -673,6 +683,110 @@ void MainWindow::stopManualMove()
         m_tempPollPaused = false;
         if (m_tempOsdEnabled) m_tempPollTimer->start(5000);
     }
+}
+
+uint8_t MainWindow::levelToRawSpeed(double level) const
+{
+    // UI 1~7 档 → 控制器使用的 0~63 原始速度（1→1，7→63）
+    const int lv = qBound(1, static_cast<int>(qRound(level)), 7);
+    return static_cast<uint8_t>(1 + (lv - 1) * 62 / 6);
+}
+
+void MainWindow::updateManualMoveSpeed()
+{
+    const uint8_t raw = levelToRawSpeed(ui->spinSpeed->value());
+
+    // 巡航中切换速度：按新速度重新发起同向运动
+    if (m_autoCruiseActive) {
+        startManualMove(0x02, raw, 0);
+        return;
+    }
+
+    if (!m_ptzManualRepeatTimer->isActive()) {
+        return;
+    }
+
+    m_ptzManualHSpeed = (m_ptzManualDirX != 0) ? raw : 0;
+    m_ptzManualVSpeed = (m_ptzManualDirY != 0) ? raw : 0;
+    emit ptzMoveDirection(m_ptzManualCmd2, m_ptzManualHSpeed, m_ptzManualVSpeed);
+}
+
+void MainWindow::startAutoCruise()
+{
+    if (!m_rgbConnected || !m_ptzConnected) {
+        QMessageBox::warning(this, "自动巡航", "请先连接设备并等待云台就绪");
+        return;
+    }
+    if (m_autoCruiseActive) {
+        return;
+    }
+
+    // 先清掉可能残留的手动运动，保证只有一个运动来源
+    stopManualMove();
+
+    const int totalSeconds = ui->spinCruiseSeconds->value();
+    m_autoCruiseActive = true;
+    m_cruiseTotalSeconds = totalSeconds;
+    m_cruiseRemainSeconds = totalSeconds;
+
+    // 转速由 spinSpeed(1~7) 决定，这里只负责“以当前速度持续同向旋转”
+    const uint8_t raw = levelToRawSpeed(ui->spinSpeed->value());
+    startManualMove(0x02, raw, 0);   // PAN_RIGHT
+
+    updateCruiseStatus();
+    m_cruiseEndTimer->start(totalSeconds * 1000);
+    m_cruiseTickTimer->start();
+    ui->textLog->append(QString("[云台] 自动巡航开始：速度档 %1，总时长 %2 秒")
+                            .arg(static_cast<int>(ui->spinSpeed->value()))
+                            .arg(totalSeconds));
+}
+
+void MainWindow::onCruiseTick()
+{
+    if (!m_autoCruiseActive) {
+        return;
+    }
+    if (m_cruiseRemainSeconds > 0) {
+        --m_cruiseRemainSeconds;
+    }
+    updateCruiseStatus();
+}
+
+void MainWindow::onCruiseEndTimeout()
+{
+    if (!m_autoCruiseActive) {
+        return;
+    }
+    ui->textLog->append("[云台] 自动巡航总时长已到，自动停止");
+    stopAutoCruise();
+}
+
+void MainWindow::updateCruiseStatus()
+{
+    const int remain = qMax(0, m_cruiseRemainSeconds);
+    ui->labelCruiseStatus->setText(QString("巡航中 剩余 %1:%2 / 总 %3 秒")
+                                       .arg(remain / 60, 2, 10, QChar('0'))
+                                       .arg(remain % 60, 2, 10, QChar('0'))
+                                       .arg(m_cruiseTotalSeconds));
+}
+
+void MainWindow::stopAutoCruise()
+{
+    if (!m_autoCruiseActive) {
+        return;
+    }
+
+    m_autoCruiseActive = false;
+    m_cruiseRemainSeconds = 0;
+    if (m_cruiseEndTimer) {
+        m_cruiseEndTimer->stop();
+    }
+    if (m_cruiseTickTimer) {
+        m_cruiseTickTimer->stop();
+    }
+    stopManualMove();
+    ui->labelCruiseStatus->setText("未巡航");
+    ui->textLog->append("[云台] 自动巡航已停止");
 }
 
 void MainWindow::handleAngleReceived(float pan, float tilt, float panSpeed, float tiltSpeed)
@@ -738,8 +852,8 @@ void MainWindow::on_rgbCheckBoxTimedCapture_stateChanged(int arg1)
         m_configManager->setCaptureQuality(ui->spinBoxQuality->value());
         m_configManager->saveConfig();
         
-        // 开始定时抓图
-        m_captureManager->startTimedCapture(ui->spinBoxInterval->value() * 1000, ui->spinBoxQuality->value(), 1920, 1080);
+        // 开始定时抓图（CaptureManager 内部乘 1000，这里只传秒）
+        m_captureManager->startTimedCapture(ui->spinBoxInterval->value(), ui->spinBoxQuality->value(), 1920, 1080);
     } else {
         // 停止定时抓图
         m_captureManager->stopTimedCapture();
@@ -762,6 +876,8 @@ void MainWindow::on_rgbBtnSelectVideoPath_clicked()
     QString path = QFileDialog::getExistingDirectory(this, "选择录像保存路径", ui->lineEditVideoSavePath->text());
     if (!path.isEmpty()) {
         ui->lineEditVideoSavePath->setText(path);
+        m_configManager->setVideoSavePath(path);
+        m_configManager->saveConfig();
     }
 }
 
@@ -790,8 +906,11 @@ void MainWindow::on_rgbBtnRecord_clicked()
         if (m_deviceManager->startRecord(fullPath)) {
             // 录像开始成功，UI更新会在 onRecordStarted 中处理
         } else {
-            QMessageBox::warning(this, "错误", "开始录像失败！");
+            // 具体原因已由 DeviceManager/RecordThread 上报：
+            // initRecord 失败会经 recordFailed → onRecordFailed 弹窗，
+            // 其余失败走 errorOccurred 显示在状态栏与错误标签。这里只复位按钮，避免重复弹窗。
             ui->rgbBtnRecord->setChecked(false);
+            ui->rgbLabelRecordStatus->setText("录像失败");
         }
     } else {
         // 停止录像
@@ -835,20 +954,51 @@ void MainWindow::onRecordStopped(const QString &filePath)
     ui->lineEditVideoSavePath->setEnabled(true);
     ui->rgbBtnSelectVideoPath->setEnabled(true);
     qDebug() << "[MainWindow] 录像已完成，文件:" << filePath;
-    
+
     // 恢复角度自动查询（空闲 5Hz）：录像结束后角度反馈仍需保持更新
     if (m_ptzController && m_ptzConnected) {
         emit ptzStartAutoQuery(200);
         qDebug() << "[MainWindow] PTZ 自动查询已恢复 (5Hz)";
     }
-    
-    // 显示数据记录文件信息
-    QString csvPath = QFileInfo(filePath).absolutePath() + "/" + QFileInfo(filePath).completeBaseName() + ".csv";
-    if (QFile::exists(csvPath)) {
-        ui->statusbar->showMessage(QString("录像已保存: %1，数据已保存: %2").arg(filePath, csvPath), 5000);
-    } else {
-        ui->statusbar->showMessage(QString("录像已保存: %1").arg(filePath), 5000);
+
+    const QFileInfo videoInfo(filePath);
+    if (!videoInfo.exists() || videoInfo.size() <= 0) {
+        onRecordFailed(QString("录像文件为空: %1").arg(filePath));
+        return;
     }
+
+    const double sizeMb = videoInfo.size() / 1024.0 / 1024.0;
+    // 显示数据记录文件信息
+    QString csvPath = videoInfo.absolutePath() + "/" + videoInfo.completeBaseName() + ".csv";
+    if (QFile::exists(csvPath)) {
+        ui->statusbar->showMessage(QString("录像已保存: %1 (%2 MB)，数据已保存: %3")
+                                       .arg(filePath)
+                                       .arg(sizeMb, 0, 'f', 1)
+                                       .arg(csvPath), 5000);
+    } else {
+        ui->statusbar->showMessage(QString("录像已保存: %1 (%2 MB)")
+                                       .arg(filePath)
+                                       .arg(sizeMb, 0, 'f', 1), 5000);
+    }
+}
+
+void MainWindow::onRecordFailed(const QString &error)
+{
+    m_recordTimer->stop();
+    m_recordSeconds = 0;
+    ui->rgbLabelRecordTime->setText("00:00:00");
+    ui->rgbBtnRecord->setChecked(false);
+    ui->rgbBtnRecord->setText("开始录像");
+    ui->rgbLabelRecordStatus->setText("录像失败");
+    ui->lineEditVideoSavePath->setEnabled(true);
+    ui->rgbBtnSelectVideoPath->setEnabled(true);
+
+    if (m_ptzController && m_ptzConnected) {
+        emit ptzStartAutoQuery(200);
+    }
+
+    ui->statusbar->showMessage(QString("录像失败: %1").arg(error), 6000);
+    QMessageBox::warning(this, "录像失败", error);
 }
 
 QString MainWindow::formatTime(int seconds)
@@ -881,7 +1031,6 @@ void MainWindow::onConnectionStatusChanged(bool connected)
             connect(m_ptzThread, &QThread::started, m_ptzController, &IPtzController::init);
 
             connect(m_ptzController, &IPtzController::angleReceived, this, &MainWindow::handleAngleReceived);
-            connect(this, &MainWindow::ptzMoveTo, m_ptzController, &IPtzController::moveTo);
             connect(this, &MainWindow::ptzStop, m_ptzController, &IPtzController::stop);
             connect(this, &MainWindow::ptzQueryAngle, m_ptzController, &IPtzController::queryAngle);
             connect(this, &MainWindow::ptzCallPreset, m_ptzController, &IPtzController::callPreset);
@@ -928,6 +1077,10 @@ void MainWindow::onConnectionStatusChanged(bool connected)
     } else {
         qInfo() << "[MainWindow] 设备断开连接，停止视频预览与云台会话";
         m_tempPollTimer->stop();
+        stopAutoCruise();
+        if (m_fpsLabel) m_fpsLabel->hide();
+        m_fpsFrameCount = 0;
+        m_fpsTimer.restart();
         // 断开时停止跟踪
         if (m_trackingController->isTracking()) {
             m_trackingController->stopTracking();
@@ -957,8 +1110,8 @@ void MainWindow::onCaptureFinished(const QImage &image, const QString &filePath)
     // 添加到历史记录
     addToHistory(image, filePath);
     
-    // 更新状态
-    ui->statusbar->showMessage(QString("抓图成功: %1").arg(QFileInfo(filePath).fileName()), 3000);
+    // 更新状态：显示完整路径，便于现场快速定位文件
+    ui->statusbar->showMessage(QString("抓图成功: %1").arg(QFileInfo(filePath).absoluteFilePath()), 5000);
 }
 
 void MainWindow::onErrorOccurred(const QString &error)
@@ -990,70 +1143,6 @@ void MainWindow::onFrameReceived(const QImage &frame)
         m_trackingController->processFrame(frame);
     }
 }
-
-void MainWindow::onFocusModeChanged(bool isManualFocus)
-{
-    if (ui->checkBoxManualFocus) {
-        // 使用 blockSignals 避免死循环
-        const bool blocked = ui->checkBoxManualFocus->blockSignals(true);
-        ui->checkBoxManualFocus->setChecked(isManualFocus);
-        ui->checkBoxManualFocus->blockSignals(blocked);
-        
-        ui->textLog->append(QString("[镜头控制] 聚焦模式已切换为: %1")
-                           .arg(isManualFocus ? "手动对焦" : "自动对焦"));
-        
-        // 【确保】变焦按钮始终启用
-        if (ui->btnZoomIn) ui->btnZoomIn->setEnabled(true);
-        if (ui->btnZoomOut) ui->btnZoomOut->setEnabled(true);
-        
-        // 【UI 联动】自动对焦模式下禁用手动对焦按钮
-        if (ui->btnFocusNear) {
-            ui->btnFocusNear->setEnabled(isManualFocus);
-        }
-        if (ui->btnFocusFar) {
-            ui->btnFocusFar->setEnabled(isManualFocus);
-        }
-    }
-}
-
-void MainWindow::on_checkBoxManualFocus_clicked(bool checked)
-{
-    if (m_deviceManager && m_deviceManager->getLensManager()) {
-        m_deviceManager->getLensManager()->setFocusMode(checked);
-    }
-}
-
-void MainWindow::onIrisModeChanged(bool isManualIris)
-{
-    if (ui->checkBoxManualIris) {
-        // 使用 blockSignals 避免死循环
-        const bool blocked = ui->checkBoxManualIris->blockSignals(true);
-        ui->checkBoxManualIris->setChecked(isManualIris);
-        ui->checkBoxManualIris->blockSignals(blocked);
-        
-        ui->textLog->append(QString("[镜头控制] 光圈模式已切换为: %1")
-                           .arg(isManualIris ? "手动/光圈优先" : "自动"));
-        
-        // 【UI 联动】自动光圈模式下禁用手动光圈按钮
-        if (ui->btnIrisOpen) {
-            ui->btnIrisOpen->setEnabled(isManualIris);
-        }
-        if (ui->btnIrisClose) {
-            ui->btnIrisClose->setEnabled(isManualIris);
-        }
-    }
-}
-
-void MainWindow::on_checkBoxManualIris_clicked(bool checked)
-{
-    if (m_deviceManager && m_deviceManager->getLensManager()) {
-        m_deviceManager->getLensManager()->setIrisMode(checked);
-    }
-}
-
-// ========================
-// 目标跟踪相关槽函数
-// ========================
 
 void MainWindow::on_btnTrackSelect_clicked()
 {
@@ -1344,6 +1433,32 @@ void MainWindow::mouseReleaseEvent(QMouseEvent *event)
                                .arg(static_cast<int>(m_selectBox.width()))
                                .arg(static_cast<int>(m_selectBox.height())), 3000);
     updateTrackingUIState();
+}
+
+void MainWindow::showTaskBoard()
+{
+    if (!m_taskBoard) {
+        m_taskBoard = new TaskBoardWindow(this);
+    }
+    if (m_taskBoard->isVisible()) {
+        m_taskBoard->raise();
+        m_taskBoard->activateWindow();
+    } else {
+        m_taskBoard->refresh();
+        m_taskBoard->show();
+        m_taskBoard->raise();
+        m_taskBoard->activateWindow();
+    }
+}
+
+void MainWindow::closeEvent(QCloseEvent *event)
+{
+    // 关闭窗口前停止所有持续动作，避免云台/录像在后台继续运行
+    stopAutoCruise();
+    if (m_deviceManager && m_deviceManager->isRecording()) {
+        m_deviceManager->stopRecord();
+    }
+    QMainWindow::closeEvent(event);
 }
 
 void MainWindow::on_btnFFC_clicked()

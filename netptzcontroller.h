@@ -30,7 +30,6 @@ public:
 
 public slots:
     void init() override;
-    void moveTo(float pan, float tilt, float speed = 0.5f) override;
     void stop() override;
     void queryAngle() override;
     void moveDirection(uint8_t cmd2, uint8_t hSpeed, uint8_t vSpeed) override;
@@ -65,7 +64,8 @@ private:
     bool m_isMoving = false;
 
     int m_minSdkSpeed = 1;
-    int m_maxSdkSpeed = 63;
+    // 241211 新版 Demo 的速度校验为 ^([1-7])$，设备实际只接受 1~7 档
+    int m_maxSdkSpeed = 7;
     AngleDecodeMode m_decodeMode = AngleDecodeMode::DeciDegree;
     int m_queryFailCount = 0;
     int m_zeroPosCount = 0; // 位置回读连续全 0 计数，用于判定设备是否支持角度回读

@@ -2,280 +2,290 @@
 #include <QDebug>
 #include <QFileInfo>
 #include <QDir>
+#include <QFile>
+#include <cstring>
 
 RecordThread::RecordThread(QObject *parent)
     : QThread(parent)
-    , m_running(false)
-    , m_initialized(false)
-    , m_frameRate(25)
-    , m_width(1920)
-    , m_height(1080)
-    , m_pts(0)
-    , m_encoderFailCount(0)
-    , m_encType(0)
-    , m_inputW(-1)
-    , m_inputH(-1)
-    , m_inputFmt(-1)
-    , m_writeFailCount(0)
-    , m_headerWritten(false)
-    , m_formatContext(nullptr)
-    , m_videoStream(nullptr)
-    , m_encoder(nullptr)
-    , m_encoderCtx(nullptr)
-    , m_packet(nullptr)
-    , m_swsCtx(nullptr)
-    , m_yuvFrame(nullptr)
 {
-    m_yuvBuffer[0] = nullptr;
-    m_yuvBuffer[1] = nullptr;
-    m_yuvBuffer[2] = nullptr;
-    m_yuvBuffer[3] = nullptr;
+    m_dataQueue.setMaxSize(300);
 }
 
 RecordThread::~RecordThread()
 {
     stopRecord();
     wait();
-    cleanup();
+
+    QMutexLocker lock(&m_paramMutex);
+    if (m_srcPar) {
+        avcodec_parameters_free(&m_srcPar);
+    }
 }
 
-void RecordThread::cleanup()
+void RecordThread::setSourceCodecParameters(const AVCodecParameters *par, AVRational timeBase, AVRational frameRate)
 {
-    // L1: 防止重复调用（run 结尾 + 析构均会调用）
-    if (!m_yuvFrame && !m_encoderCtx && !m_formatContext && !m_packet && !m_swsCtx) {
-        return;
+    QMutexLocker lock(&m_paramMutex);
+    if (m_srcPar) {
+        avcodec_parameters_free(&m_srcPar);
+        m_srcPar = nullptr;
+    }
+    if (par) {
+        m_srcPar = avcodec_parameters_alloc();
+        if (m_srcPar && avcodec_parameters_copy(m_srcPar, par) < 0) {
+            avcodec_parameters_free(&m_srcPar);
+            m_srcPar = nullptr;
+        }
+    }
+    m_srcTimeBase = (timeBase.num > 0 && timeBase.den > 0) ? timeBase : AVRational{1, 25};
+    m_srcFrameRate = (frameRate.num > 0 && frameRate.den > 0) ? frameRate : AVRational{25, 1};
+}
+
+bool RecordThread::initRecord(const QString &filePath)
+{
+    if (isRunning()) {
+        emit errorOccurred("上一次录像尚未结束");
+        return false;
     }
 
-    // L4: 先释放 frame 再释放 buffer，避免悬垂引用
-    if (m_yuvFrame) {
-        av_frame_free(&m_yuvFrame);
+    {
+        QMutexLocker lock(&m_paramMutex);
+        if (!m_srcPar) {
+            emit errorOccurred("未获取到 RTSP 编码参数，无法录像");
+            return false;
+        }
     }
 
-    if (m_yuvBuffer[0]) {
-        av_freep(&m_yuvBuffer[0]);
+    m_filePath = QFileInfo(filePath).absoluteFilePath();
+    QFileInfo fi(m_filePath);
+    QDir dir(fi.absolutePath());
+    if (!dir.exists() && !dir.mkpath(".")) {
+        emit errorOccurred("无法创建录像目录");
+        return false;
     }
-    
-    if (m_swsCtx) {
-        sws_freeContext(m_swsCtx);
-        m_swsCtx = nullptr;
+
+    m_dataQueue.setMaxSize(300);
+    m_dataQueue.reset();   // stop() 不可逆，每次录像开始前必须复位
+
+    {
+        QMutexLocker lock(&m_abortMutex);
+        m_abortReason.clear();
     }
-    
-    if (m_packet) {
-        av_packet_free(&m_packet);
-    }
-    
-    if (m_encoderCtx) {
-        avcodec_free_context(&m_encoderCtx);
-    }
-    
-    if (m_formatContext) {
-        if (m_headerWritten && m_formatContext->pb) {
-            av_write_trailer(m_formatContext);
-        }
-        if (m_formatContext->pb) {
-            avio_closep(&m_formatContext->pb);
-        }
-        avformat_free_context(m_formatContext);
-        m_formatContext = nullptr;
-    }
-    m_videoStream = nullptr;
-    m_initialized = false;
+    m_writeFailCount = 0;
     m_headerWritten = false;
-}
+    m_tsOffset = AV_NOPTS_VALUE;
+    m_lastDts = AV_NOPTS_VALUE;
+    m_running.store(true);
 
-bool RecordThread::initEncoder(int width, int height)
-{
-    m_width = width;
-    m_height = height;
-
-    // 查找 H.264 编码器
-    m_encoder = avcodec_find_encoder(AV_CODEC_ID_H264);
-    if (!m_encoder) {
-        m_encoder = avcodec_find_encoder_by_name("libx264");
-    }
-    if (!m_encoder) {
-        emit errorOccurred("找不到 H.264 编码器");
-        return false;
-    }
-
-    m_encoderCtx = avcodec_alloc_context3(m_encoder);
-    if (!m_encoderCtx) {
-        emit errorOccurred("无法分配编码器上下文");
-        return false;
-    }
-
-    // 设置编码参数
-    m_encoderCtx->codec_id = AV_CODEC_ID_H264;
-    m_encoderCtx->codec_type = AVMEDIA_TYPE_VIDEO;
-    m_encoderCtx->width = m_width;
-    m_encoderCtx->height = m_height;
-    m_encoderCtx->time_base = {1, m_frameRate};
-    m_encoderCtx->framerate = {m_frameRate, 1};
-    m_encoderCtx->gop_size = 30;
-    m_encoderCtx->max_b_frames = 2;
-    m_encoderCtx->pix_fmt = AV_PIX_FMT_YUV420P;
-    m_encoderCtx->bit_rate = 4000000;
-
-    // 设置编码速度（速度优先）
-    av_opt_set(m_encoderCtx->priv_data, "preset", "ultrafast", 0);
-    av_opt_set(m_encoderCtx->priv_data, "tune", "zerolatency", 0);
-
-    if (avcodec_open2(m_encoderCtx, m_encoder, nullptr) < 0) {
-        emit errorOccurred("无法打开编码器");
-        // 只清理编码器相关资源，不动 m_formatContext，避免后续 run() 循环中空指针崩溃
-        if (m_encoderCtx) {
-            avcodec_free_context(&m_encoderCtx);
-        }
-        return false;
-    }
-
-    // 分配 YUV 帧
-    m_yuvFrame = av_frame_alloc();
-    if (!m_yuvFrame) {
-        emit errorOccurred("无法分配 YUV 帧");
-        avcodec_free_context(&m_encoderCtx);
-        return false;
-    }
-    m_yuvFrame->format = AV_PIX_FMT_YUV420P;
-    m_yuvFrame->width = m_width;
-    m_yuvFrame->height = m_height;
-
-    av_image_alloc(m_yuvBuffer, m_yuvLinesize, m_width, m_height, AV_PIX_FMT_YUV420P, 32);
-    av_image_fill_arrays(m_yuvFrame->data, m_yuvFrame->linesize, m_yuvBuffer[0], 
-                        AV_PIX_FMT_YUV420P, m_width, m_height, 1);
-
-    m_packet = av_packet_alloc();
-    if (!m_packet) {
-        emit errorOccurred("无法分配 packet");
-        av_frame_free(&m_yuvFrame);
-        av_freep(&m_yuvBuffer[0]);
-        avcodec_free_context(&m_encoderCtx);
-        return false;
-    }
-
-    qDebug() << "[RecordThread] 编码器初始化成功" << m_width << "x" << m_height << "@" << m_frameRate << "fps";
+    qInfo() << "[RecordThread] 初始化完成，等待关键帧:" << m_filePath;
     return true;
 }
 
-bool RecordThread::initRecord(const QString& filePath, int frameRate)
+void RecordThread::pushPacket(const EncodedPacket &pkt)
 {
-    m_filePath = filePath;
-    m_frameRate = frameRate > 0 ? frameRate : 25;
-    m_pts = 0;
-    m_dataQueue.clear();
-
-    QFileInfo fileInfo(filePath);
-    QString dirPath = fileInfo.absolutePath();
-    QDir dir(dirPath);
-    if (!dir.exists()) {
-        dir.mkpath(".");
-    }
-
-    // 初始化解码器（按相机实际编码类型，避免 H.265 流下录像全黑）
-    if (!m_decoder.init(VideoDecoder::codecIdFromEncType(m_encType))) {
-        emit errorOccurred("无法初始化解码器");
-        return false;
-    }
-
-    // 先不用初始化编码器，等得到第一帧后知道准确分辨率再初始化
-    // 创建输出格式上下文
-    const AVOutputFormat* outputFormat = av_guess_format("mp4", nullptr, nullptr);
-    if (!outputFormat) {
-        emit errorOccurred("无法确定输出格式");
-        return false;
-    }
-
-    int ret = avformat_alloc_output_context2(&m_formatContext, outputFormat, nullptr, filePath.toUtf8().constData());
-    if (ret < 0 || !m_formatContext) {
-        emit errorOccurred(QString("分配输出上下文失败: %1").arg(ret));
-        return false;
-    }
-
-    m_initialized = true;
-    qDebug() << "[RecordThread] 初始化成功，等待第一帧数据";
-    return true;
-}
-
-void RecordThread::pushData(const QByteArray &data)
-{
-    if (m_running) {
-        m_dataQueue.push(data);
+    if (m_running.load()) {
+        m_dataQueue.push(pkt);
     }
 }
 
 void RecordThread::stopRecord()
 {
-    m_running = false;
+    m_running.store(false);
     m_dataQueue.stop();
 }
 
-bool RecordThread::writeVideoFrame(AVFrame* frame)
+void RecordThread::abortRecording(const QString &reason)
 {
-    if (!m_encoderCtx || !m_formatContext || !m_videoStream) {
-        return false;
-    }
-
-    // RGB 转 YUV：输入分辨率/像素格式变化时必须重建 sws 上下文，
-    // 否则 sws_scale 仍按旧尺寸读取源数据，直接越界崩溃（相机切子码流/变倍时会发生）
-    if (!m_swsCtx || m_inputW != frame->width || m_inputH != frame->height
-        || m_inputFmt != frame->format) {
-        if (m_swsCtx) {
-            sws_freeContext(m_swsCtx);
-            m_swsCtx = nullptr;
+    {
+        QMutexLocker lock(&m_abortMutex);
+        if (m_abortReason.isEmpty()) {
+            m_abortReason = reason;
         }
-        m_swsCtx = sws_getContext(
-            frame->width, frame->height, static_cast<AVPixelFormat>(frame->format),
-            m_width, m_height, AV_PIX_FMT_YUV420P,
-            SWS_BILINEAR, nullptr, nullptr, nullptr
-        );
-        m_inputW = frame->width;
-        m_inputH = frame->height;
-        m_inputFmt = frame->format;
-        // 编码分辨率固定为编码器初始化时的分辨率，输入变化由 sws 缩放吸收
-        // （因此 m_yuvBuffer / m_yuvFrame 不需要跟着重建）
+    }
+    m_running.store(false);
+    m_dataQueue.stop();
+}
+
+bool RecordThread::openOutput()
+{
+    AVCodecParameters *par = nullptr;
+    AVRational srcTimeBase{1, 25};
+    AVRational srcFrameRate{25, 1};
+
+    {
+        QMutexLocker lock(&m_paramMutex);
+        if (!m_srcPar) {
+            return false;
+        }
+        par = avcodec_parameters_alloc();
+        if (!par || avcodec_parameters_copy(par, m_srcPar) < 0) {
+            avcodec_parameters_free(&par);
+            QMutexLocker abortLock(&m_abortMutex);
+            if (m_abortReason.isEmpty()) m_abortReason = "复制编码参数失败";
+            return false;
+        }
+        srcTimeBase = m_srcTimeBase;
+        srcFrameRate = m_srcFrameRate;
     }
 
-    if (!m_swsCtx) {
-        qWarning() << "[RecordThread] sws 上下文创建失败，跳过当前帧";
+    const auto setReason = [this](const QString &reason) {
+        QMutexLocker lock(&m_abortMutex);
+        if (m_abortReason.isEmpty()) m_abortReason = reason;
+    };
+
+    int ret = avformat_alloc_output_context2(&m_formatContext, nullptr, "mp4",
+                                             m_filePath.toUtf8().constData());
+    if (ret < 0 || !m_formatContext) {
+        avcodec_parameters_free(&par);
+        setReason(QString("无法创建 MP4 输出上下文(%1)").arg(ret));
         return false;
     }
 
-    if (m_swsCtx) {
-        sws_scale(m_swsCtx,
-                  frame->data, frame->linesize, 0, frame->height,
-                  m_yuvFrame->data, m_yuvFrame->linesize);
+    m_videoStream = avformat_new_stream(m_formatContext, nullptr);
+    if (!m_videoStream) {
+        avcodec_parameters_free(&par);
+        setReason("无法创建输出视频流");
+        return false;
     }
 
-    m_yuvFrame->pts = m_pts++;
+    if (avcodec_parameters_copy(m_videoStream->codecpar, par) < 0) {
+        avcodec_parameters_free(&par);
+        setReason("无法复制输出编码参数");
+        return false;
+    }
+    avcodec_parameters_free(&par);
 
-    // 发送帧到编码器
-    int ret = avcodec_send_frame(m_encoderCtx, m_yuvFrame);
+    // H.265 使用 hvc1 标记，提升播放器兼容性；H.264 交给封装器决定
+    m_videoStream->codecpar->codec_tag =
+        (m_videoStream->codecpar->codec_id == AV_CODEC_ID_HEVC) ? MKTAG('h', 'v', 'c', '1') : 0;
+    m_videoStream->time_base = srcTimeBase;
+    m_videoStream->avg_frame_rate = srcFrameRate;
+    m_videoStream->r_frame_rate = srcFrameRate;
+
+    if (!(m_formatContext->oformat->flags & AVFMT_NOFILE)) {
+        ret = avio_open(&m_formatContext->pb, m_filePath.toUtf8().constData(), AVIO_FLAG_WRITE);
+        if (ret < 0) {
+            setReason(QString("无法打开录像文件(%1)").arg(ret));
+            return false;
+        }
+    }
+
+    AVDictionary *options = nullptr;
+    av_dict_set(&options, "movflags", "faststart", 0);
+    // 时间戳从 0 开始，避免负数或巨大起始时间被写进 moov
+    m_formatContext->avoid_negative_ts = AVFMT_AVOID_NEG_TS_MAKE_ZERO;
+    ret = avformat_write_header(m_formatContext, &options);
+    av_dict_free(&options);
     if (ret < 0) {
-        qWarning() << "[RecordThread] 发送帧失败:" << ret;
+        setReason(QString("写入 MP4 文件头失败(%1)").arg(ret));
         return false;
     }
 
-    // 接收编码后的包
-    while (ret >= 0) {
-        ret = avcodec_receive_packet(m_encoderCtx, m_packet);
-        if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) {
-            break;
-        } else if (ret < 0) {
-            qWarning() << "[RecordThread] 编码失败:" << ret;
+    m_headerWritten = true;
+    qInfo() << "[RecordThread] 开始封装原始码流:" << m_videoStream->codecpar->width
+            << "x" << m_videoStream->codecpar->height
+            << "codec=" << avcodec_get_name(m_videoStream->codecpar->codec_id);
+    return true;
+}
+
+bool RecordThread::writePacket(const EncodedPacket &pkt)
+{
+    if (!m_formatContext || !m_videoStream) {
+        return false;
+    }
+
+    AVPacket *out = av_packet_alloc();
+    if (!out) {
+        return false;
+    }
+    if (av_new_packet(out, pkt.data.size()) < 0) {
+        av_packet_free(&out);
+        return false;
+    }
+    std::memcpy(out->data, pkt.data.constData(), static_cast<size_t>(pkt.data.size()));
+
+    // 把设备时钟时间戳平移成从 0 开始：否则 MP4 的 start_time 可能是几百秒，
+    // 部分播放器会认为文件损坏或把（起始偏移+时长）当成总时长。
+    int64_t pts = pkt.pts;
+    int64_t dts = pkt.dts;
+    if (dts == AV_NOPTS_VALUE) {
+        dts = pts;   // RTSP 只给 pts 时用 pts 兜底，封装器要求 dts 有效
+    }
+    if (m_tsOffset == AV_NOPTS_VALUE) {
+        const int64_t ref = (dts != AV_NOPTS_VALUE) ? dts : pts;
+        m_tsOffset = (ref != AV_NOPTS_VALUE) ? ref : 0;
+    }
+    if (pts != AV_NOPTS_VALUE) {
+        pts -= m_tsOffset;
+    }
+    if (dts != AV_NOPTS_VALUE) {
+        dts -= m_tsOffset;
+        // DTS 必须严格递增，重复/回退会让 MP4 封装直接失败
+        if (m_lastDts != AV_NOPTS_VALUE && dts <= m_lastDts) {
+            dts = m_lastDts + 1;
+        }
+        m_lastDts = dts;
+        if (pts != AV_NOPTS_VALUE && pts < dts) {
+            pts = dts;
+        }
+    }
+
+    out->pts = pts;
+    out->dts = dts;
+    out->flags = pkt.key ? AV_PKT_FLAG_KEY : 0;
+    out->stream_index = m_videoStream->index;
+    out->pos = -1;
+
+    AVRational srcTimeBase{1, 25};
+    {
+        QMutexLocker lock(&m_paramMutex);
+        srcTimeBase = m_srcTimeBase;
+    }
+    av_packet_rescale_ts(out, srcTimeBase, m_videoStream->time_base);
+
+    const int ret = av_interleaved_write_frame(m_formatContext, out);
+    av_packet_free(&out);
+    if (ret < 0) {
+        qWarning() << "[RecordThread] 写入失败:" << ret;
+        return false;
+    }
+    return true;
+}
+
+void RecordThread::run()
+{
+    qInfo() << "[RecordThread] 录像线程启动:" << m_filePath;
+
+    EncodedPacket pkt;
+    while (m_running.load()) {
+        if (!m_dataQueue.waitAndPop(pkt, 100)) {
+            continue;
+        }
+        if (!m_running.load()) {
             break;
         }
+        if (pkt.data.isEmpty()) {
+            continue;
+        }
 
-        m_packet->stream_index = m_videoStream->index;
-        av_packet_rescale_ts(m_packet, m_encoderCtx->time_base, m_videoStream->time_base);
-        const int writeRet = av_interleaved_write_frame(m_formatContext, m_packet);
-        av_packet_unref(m_packet);
+        // 从下一个关键帧开始写，保证 MP4 首帧可解码
+        if (!m_headerWritten) {
+            if (!pkt.key) {
+                continue;
+            }
+            if (!openOutput()) {
+                m_running.store(false);
+                break;
+            }
+        }
 
-        // 磁盘满/IO 错误时必须暴露出来，否则文件静默损坏、无人知晓
-        if (writeRet < 0) {
-            if (++m_writeFailCount >= 10) {
-                qCritical() << "[RecordThread] 录像写入连续失败" << m_writeFailCount << "次:" << writeRet;
-                emit errorOccurred(QString("录像写入连续失败(%1)，已停止录像").arg(writeRet));
-                m_running = false;  // 交回 run() 循环收尾（写 trailer、关闭文件）
+        if (!writePacket(pkt)) {
+            ++m_writeFailCount;
+            if (m_writeFailCount >= 10) {
+                QMutexLocker lock(&m_abortMutex);
+                if (m_abortReason.isEmpty()) {
+                    m_abortReason = "录像写入连续失败，已停止录像";
+                }
+                m_running.store(false);
                 break;
             }
         } else {
@@ -283,108 +293,61 @@ bool RecordThread::writeVideoFrame(AVFrame* frame)
         }
     }
 
-    return true;
+    finalize();
+    qInfo() << "[RecordThread] 录像线程结束";
 }
 
-void RecordThread::run()
+void RecordThread::finalize()
 {
-    m_running = true;
-    QByteArray data;
-    bool encoderReady = false;
+    QString reason;
+    {
+        QMutexLocker lock(&m_abortMutex);
+        reason = m_abortReason;
+    }
 
-    qDebug() << "[RecordThread] 开始录制线程";
-
-    while (m_running) {
-        if (m_dataQueue.waitAndPop(data, 100)) {
-            if (!data.isEmpty()) {
-             try {
-                // 解码帧
-                QImage qImage = m_decoder.decodeFrame(
-                    reinterpret_cast<uint8_t*>(data.data()),
-                    data.size()
-                );
-
-                if (!qImage.isNull()) {
-                    // 如果编码器还没准备好，现在初始化（用实际分辨率）
-                    if (!encoderReady) {
-                        if (!initEncoder(qImage.width(), qImage.height())) {
-                            m_encoderFailCount++;
-                            if (m_encoderFailCount >= 3) {
-                                emit errorOccurred("编码器初始化连续失败 3 次，停止录像");
-                                break;
-                            }
-                            continue;
-                        }
-
-                        // 创建视频流
-                        m_videoStream = avformat_new_stream(m_formatContext, nullptr);
-                        if (!m_videoStream) {
-                            emit errorOccurred("无法创建视频流");
-                            break;
-                        }
-                        avcodec_parameters_from_context(m_videoStream->codecpar, m_encoderCtx);
-                        m_videoStream->time_base = {1, m_frameRate};
-
-                        // 打开文件
-                        if (!(m_formatContext->oformat->flags & AVFMT_NOFILE)) {
-                            int ret = avio_open(&m_formatContext->pb, m_filePath.toUtf8().constData(), AVIO_FLAG_WRITE);
-                            if (ret < 0) {
-                                emit errorOccurred(QString("无法打开文件: %1").arg(ret));
-                                break;
-                            }
-                        }
-
-                        // 写文件头
-                        AVDictionary* options = nullptr;
-                        av_dict_set(&options, "movflags", "faststart", 0);
-                        int headerRet = avformat_write_header(m_formatContext, &options);
-                        av_dict_free(&options);
-                        if (headerRet < 0) {
-                            emit errorOccurred("无法写入文件头");
-                            break;
-                        }
-                        m_headerWritten = true;  // R-06: 标记 header 写入成功
-
-                        encoderReady = true;
-                        qDebug() << "[RecordThread] 录制开始";
-                    }
-
-                    // 将 QImage 转换为 AVFrame(RGB24) 并写入
-                    if (encoderReady) {
-                        AVFrame* rgbFrame = av_frame_alloc();
-                        if (rgbFrame) {
-                            rgbFrame->format = AV_PIX_FMT_RGB24;
-                            rgbFrame->width = qImage.width();
-                            rgbFrame->height = qImage.height();
-
-                            av_image_fill_arrays(rgbFrame->data, rgbFrame->linesize,
-                                               qImage.bits(), AV_PIX_FMT_RGB24,
-                                               qImage.width(), qImage.height(), 1);
-
-                            writeVideoFrame(rgbFrame);
-                            av_frame_free(&rgbFrame);
-                        }
-                    }
+    bool trailerOk = true;
+    if (m_formatContext) {
+        if (m_headerWritten) {
+            const int ret = av_write_trailer(m_formatContext);
+            if (ret < 0) {
+                trailerOk = false;
+                if (reason.isEmpty()) {
+                    reason = QString("写入 MP4 文件尾失败(%1)").arg(ret);
                 }
-             } catch (...) {
-                 qDebug() << "[RecordThread] 录像处理异常，跳过当前帧";
-             }
             }
         }
-    }
-
-    // 刷新编码器
-    if (encoderReady && m_encoderCtx) {
-        avcodec_send_frame(m_encoderCtx, nullptr);
-        while (avcodec_receive_packet(m_encoderCtx, m_packet) >= 0) {
-            m_packet->stream_index = m_videoStream->index;
-            av_packet_rescale_ts(m_packet, m_encoderCtx->time_base, m_videoStream->time_base);
-            av_interleaved_write_frame(m_formatContext, m_packet);
-            av_packet_unref(m_packet);
+        if (m_formatContext->pb) {
+            avio_closep(&m_formatContext->pb);
         }
+        avformat_free_context(m_formatContext);
+        m_formatContext = nullptr;
+        m_videoStream = nullptr;
     }
 
-    cleanup();
+    const bool wroteHeader = m_headerWritten;
+    m_headerWritten = false;
+
+    if (!wroteHeader) {
+        QFile::remove(m_filePath);
+        emit errorOccurred(reason.isEmpty() ? "未收到关键帧，录像未生成" : reason);
+        qWarning() << "[RecordThread] 录像失败:" << reason;
+        return;
+    }
+
+    if (!trailerOk) {
+        QFile::remove(m_filePath);
+        emit errorOccurred(reason);
+        qWarning() << "[RecordThread] 录像文件损坏，已删除:" << m_filePath << reason;
+        return;
+    }
+
+    if (!reason.isEmpty()) {
+        // 文件已正常收尾，保留以便回看，同时通知 UI 复位
+        emit errorOccurred(reason);
+        qWarning() << "[RecordThread] 录像提前结束，文件已保留:" << m_filePath << reason;
+        return;
+    }
+
     emit recordFinished(m_filePath);
-    qDebug() << "[RecordThread] 录制线程结束";
+    qInfo() << "[RecordThread] 录像完成:" << m_filePath;
 }

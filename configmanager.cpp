@@ -4,6 +4,33 @@
 #include <QDebug>
 #include <QCoreApplication>
 #include <QDir>
+#include <QFileInfo>
+
+namespace {
+
+// 保存路径规范化：
+// - 空路径 → 程序目录下的默认目录
+// - 旧项目路径（含 RGB_PTZ_demo）→ 默认目录，避免继续写到已废弃的工程目录
+// - 相对路径 → 基于程序目录的绝对路径，避免落到不确定的当前工作目录
+// - 其他自定义绝对路径保持不变
+QString normalizeSavePath(const QString &path, const QString &fallbackDir)
+{
+    const QString defaultPath = QDir::cleanPath(fallbackDir);
+    const QString trimmed = path.trimmed();
+    if (trimmed.isEmpty()) {
+        return defaultPath;
+    }
+    if (trimmed.contains("RGB_PTZ_demo", Qt::CaseInsensitive)) {
+        return defaultPath;
+    }
+    QFileInfo fi(trimmed);
+    if (fi.isRelative()) {
+        return QDir::cleanPath(QDir(QCoreApplication::applicationDirPath()).absoluteFilePath(trimmed));
+    }
+    return QDir::cleanPath(trimmed);
+}
+
+} // namespace
 
 // P7/P8：
 // - 所有 getter/setter 加互斥锁（配置可能被 UI 线程与工作线程并发读写）
@@ -15,7 +42,7 @@ ConfigManager::ConfigManager(QObject *parent) : QObject(parent)
     , m_deviceUsername("admin")
     , m_rtspPath("Streaming/Channels/101")
     , m_captureInterval(10)
-    , m_captureQuality(80)
+    , m_captureQuality(1)
     , m_savePath(QCoreApplication::applicationDirPath() + "/captures")
     , m_trackKp(0.15f)
     , m_trackKi(0.005f)
@@ -204,14 +231,39 @@ void ConfigManager::loadConfig()
 {
     // 加载于构造函数（单线程阶段），无需加锁
     QSettings settings("RGB_PTZ", "RGB_PTZ_Integrated");
+    bool needSave = false;
+
+    const QString defaultCaptureDir = QCoreApplication::applicationDirPath() + "/captures";
+    const QString defaultVideoDir = QCoreApplication::applicationDirPath() + "/videos";
+
     m_deviceIP = settings.value("device/ip", "192.168.1.68").toString();
     m_deviceUsername = settings.value("device/username", "admin").toString();
     m_rtspPath = settings.value("device/rtspPath", "Streaming/Channels/101").toString();
     // P8：密码不设明文默认值，QSettings 无记录时为空 → UI 密码框留空待输入
     m_devicePassword = settings.value("device/password").toString();
-    m_captureInterval = settings.value("capture/interval", 10).toInt();
-    m_captureQuality = settings.value("capture/quality", 80).toInt();
-    m_savePath = settings.value("capture/savePath", QCoreApplication::applicationDirPath() + "/captures").toString();
+
+    m_captureInterval = qMax(1, settings.value("capture/interval", 10).toInt());
+
+    // SDK 质量档只有 0/1/2；旧版本保存的是 1~100，统一迁移为“较好”
+    int quality = settings.value("capture/quality", 1).toInt();
+    if (quality < 0 || quality > 2) {
+        quality = 1;
+        needSave = true;
+    }
+    m_captureQuality = quality;
+
+    const QString rawCapturePath = settings.value("capture/savePath", defaultCaptureDir).toString();
+    m_savePath = normalizeSavePath(rawCapturePath, defaultCaptureDir);
+    if (m_savePath != rawCapturePath) {
+        needSave = true;
+    }
+
+    const QString rawVideoPath = settings.value("video/savePath", defaultVideoDir).toString();
+    m_videoSavePath = normalizeSavePath(rawVideoPath, defaultVideoDir);
+    if (m_videoSavePath != rawVideoPath) {
+        needSave = true;
+    }
+
     m_trackKp = settings.value("track/kp", 0.15f).toFloat();
     m_trackKi = settings.value("track/ki", 0.005f).toFloat();
     m_trackKd = settings.value("track/kd", 0.03f).toFloat();
@@ -219,6 +271,10 @@ void ConfigManager::loadConfig()
     m_trackTPredict = settings.value("track/tPredict", 5).toInt();
     m_trackDeadZone = settings.value("track/deadZone", 15).toInt();
     m_trackMaxSpeed = settings.value("track/maxSpeed", 20).toInt();
-    m_videoSavePath = settings.value("video/savePath", QCoreApplication::applicationDirPath() + "/videos").toString();
+
+    if (needSave) {
+        // 迁移结果立即落盘，避免每次启动重复校正
+        saveConfig();
+    }
     qDebug() << "Config loaded";
 }

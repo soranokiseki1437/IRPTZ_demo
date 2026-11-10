@@ -26,7 +26,8 @@ SOURCES += \
     dsstcore.cpp \
     logmanager.cpp \
     logging_categories.cpp \
-    imagematconvert.cpp
+    imagematconvert.cpp \
+    taskboardwindow.cpp
 
 HEADERS += \
     mainwindow.h \
@@ -52,7 +53,8 @@ HEADERS += \
     dsstcore.h \
     logmanager.h \
     logging_categories.h \
-    imagematconvert.h
+    imagematconvert.h \
+    taskboardwindow.h
 
 FORMS += \
     mainwindow.ui

@@ -182,47 +182,6 @@ void NetPtzController::onStopWatchdogTimeout()
     stop();
 }
 
-void NetPtzController::moveTo(float pan, float tilt, float /*speed*/)
-{
-    if (!isOpen()) return;
-
-    // SV_NET_DEV_SetPtzPosition 是"场景坐标配置"接口（结构体含场景名称/使能位），
-    // 只写配置不会驱动云台，必须再对该场景号调用 RUN_PRESET 才会运动。
-    // 场景号 2 用于"移动"按钮的绝对定位，避免覆盖复位点所用的预置位 1
-    const int sceneId = 2;
-
-    SV_NET_DEV_PTZ_POSITION pos{};
-    pos.byEnable = 1;
-    pos.struPtzPos.wAction = 1;
-    float scale = (m_decodeMode == AngleDecodeMode::CentiDegree) ? 100.0f : 10.0f;
-    float normPan = std::fmod(pan, 360.0f);
-    if (normPan < 0) normPan += 360.0f;
-    float normTilt = (tilt < 0) ? (360.0f + tilt) : tilt;
-    pos.struPtzPos.wPanPos  = static_cast<WORD>(qRound(normPan * scale));
-    pos.struPtzPos.wTiltPos = static_cast<WORD>(qRound(normTilt * scale));
-
-    const LONG cfgRet = SV_NET_DEV_SetPtzPosition(m_session->userId(), m_channel, sceneId, &pos);
-    if (cfgRet < 0) {
-        qWarning() << "[NetPtzController] 配置定位场景失败 ret =" << cfgRet
-                   << " SDK err =" << SV_NET_DEV_GetLastError()
-                   << " pan =" << pan << "tilt =" << tilt;
-        return;
-    }
-
-    const LONG runRet = SV_NET_DEV_PTZPreset_EX(m_session->userId(), m_channel,
-                                                RUN_PRESET, sceneId);
-    if (runRet < 0) {
-        qWarning() << "[NetPtzController] 调用定位场景失败 ret =" << runRet
-                   << " SDK err =" << SV_NET_DEV_GetLastError()
-                   << " scene =" << sceneId;
-    } else {
-        qInfo() << "[NetPtzController] 已下发定位请求 pan =" << pan << "tilt =" << tilt
-                << " raw pan =" << pos.struPtzPos.wPanPos
-                << " raw tilt =" << pos.struPtzPos.wTiltPos
-                << " scene =" << sceneId;
-    }
-}
-
 void NetPtzController::callPreset(uint8_t presetId)
 {
     if (!isOpen()) return;

@@ -8,6 +8,7 @@
 #include <QLabel>
 #include <QSpinBox>
 #include <QTimer>
+#include <QElapsedTimer>
 #include "iptzcontroller.h"
 #include "netptzcontroller.h"
 #include "devicemanager.h"
@@ -24,6 +25,9 @@ class MainWindow;
 }
 QT_END_NAMESPACE
 
+class TaskBoardWindow;
+class QCloseEvent;
+
 class MainWindow : public QMainWindow
 {
     Q_OBJECT
@@ -37,7 +41,6 @@ private slots:
     void onErrorOccurred(const QString &error);
 
     // PTZ 控制相关槽
-    void on_btnMove_clicked();
     void on_btnStop_clicked();
     void on_btnQuery_clicked();
     void on_btnReset_clicked();
@@ -57,14 +60,8 @@ private slots:
     void onRecordTimerTimeout();
     void onRecordStarted();
     void onRecordStopped(const QString &filePath);
+    void onRecordFailed(const QString &error);
     
-    // 聚焦模式相关槽
-    void onFocusModeChanged(bool isManualFocus);
-    void on_checkBoxManualFocus_clicked(bool checked);
-    // 光圈模式相关槽
-    void onIrisModeChanged(bool isManualIris);
-    void on_checkBoxManualIris_clicked(bool checked);
-
     // 目标跟踪相关槽
     void on_btnTrackSelect_clicked();
     void on_btnTrackStart_clicked();
@@ -85,7 +82,6 @@ private slots:
 
 signals:
     // 跨线程调用PTZ控制器的信号
-    void ptzMoveTo(float pan, float tilt, float speed);
     void ptzStop();
     void ptzQueryAngle();
     void ptzCallPreset(uint8_t presetId);
@@ -120,6 +116,20 @@ private:
     // 方向盘手动连续运动：按住期间周期性重发方向命令，维持云台持续转动
     void startManualMove(uint8_t cmd2, uint8_t hSpeed, uint8_t vSpeed);
     void stopManualMove();
+    // 速度档位（1~7）映射到控制器使用的 0~63 原始速度
+    uint8_t levelToRawSpeed(double level) const;
+    // 按住方向键期间速度变化：按当前方向立即重发
+    void updateManualMoveSpeed();
+
+    // 自动巡航
+    void startAutoCruise();
+    void stopAutoCruise();
+    void onCruiseEndTimeout();
+    void onCruiseTick();
+    void updateCruiseStatus();
+
+    // 悬浮长任务看板
+    void showTaskBoard();
 
 private:
     Ui::MainWindow *ui;
@@ -141,6 +151,24 @@ private:
     uint8_t m_ptzManualCmd2;
     uint8_t m_ptzManualHSpeed;
     uint8_t m_ptzManualVSpeed;
+    int m_ptzManualDirX = 0;   // 当前按压的水平轴（-1/0/1）
+    int m_ptzManualDirY = 0;   // 当前按压的垂直轴（-1/0/1）
+
+    // 自动巡航
+    bool m_autoCruiseActive = false;
+    int m_cruiseTotalSeconds = 0;
+    int m_cruiseRemainSeconds = 0;
+    QTimer *m_cruiseEndTimer = nullptr;
+    QTimer *m_cruiseTickTimer = nullptr;
+
+    // 实时帧率叠层
+    QLabel *m_fpsLabel = nullptr;
+    int m_fpsFrameCount = 0;
+    QElapsedTimer m_fpsTimer;
+    QString m_streamInfo;
+
+    // 悬浮长任务看板
+    TaskBoardWindow *m_taskBoard = nullptr;
     
     // RGB 相关
     DeviceManager *m_deviceManager;
@@ -171,6 +199,7 @@ protected:
     void mousePressEvent(QMouseEvent *event) override;
     void mouseMoveEvent(QMouseEvent *event) override;
     void mouseReleaseEvent(QMouseEvent *event) override;
+    void closeEvent(QCloseEvent *event) override;
 };
 
 #endif // MAINWINDOW_H

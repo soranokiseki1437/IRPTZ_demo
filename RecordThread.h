@@ -3,15 +3,23 @@
 
 #include <QThread>
 #include <QMutex>
+#include <QByteArray>
+#include <atomic>
+
 #include "ThreadSafeQueue.h"
-#include "videodecoder.h"
 
 extern "C" {
 #include <libavformat/avformat.h>
 #include <libavcodec/avcodec.h>
-#include <libavutil/opt.h>
-#include <libswscale/swscale.h>
 }
+
+// RTSP 原始编码包：录像直接封装，不做解码/重编码
+struct EncodedPacket {
+    QByteArray data;
+    int64_t pts = AV_NOPTS_VALUE;
+    int64_t dts = AV_NOPTS_VALUE;
+    bool key = false;
+};
 
 class RecordThread : public QThread
 {
@@ -21,12 +29,14 @@ public:
     explicit RecordThread(QObject *parent = nullptr);
     ~RecordThread();
 
-    bool initRecord(const QString& filePath, int frameRate);
-    void pushData(const QByteArray &data);
-    void stopRecord();
+    // 保存源流编码参数（RTSP 连接成功后调用），内部深拷贝
+    void setSourceCodecParameters(const AVCodecParameters *par, AVRational timeBase, AVRational frameRate);
 
-    // 设置相机编码类型（UNIV_DEV_VIDEO_ENC_PARAM.videoEncType），在 initRecord 前调用
-    void setEncType(int encType) { m_encType = encType; }
+    bool initRecord(const QString &filePath);
+    void pushPacket(const EncodedPacket &pkt);
+    void stopRecord();
+    // RTSP 断流等异常场景：立即停止并记录原因，由线程收尾时统一上报
+    void abortRecording(const QString &reason);
 
 signals:
     void errorOccurred(const QString &error);
@@ -36,39 +46,31 @@ protected:
     void run() override;
 
 private:
-    void cleanup();
-    bool writeVideoFrame(AVFrame* frame);
-    bool initEncoder(int width, int height);
+    bool openOutput();
+    bool writePacket(const EncodedPacket &pkt);
+    void finalize();
 
-    ThreadSafeQueue<QByteArray> m_dataQueue;
+    ThreadSafeQueue<EncodedPacket> m_dataQueue;
     QString m_filePath;
-    bool m_running;
-    bool m_initialized;
-    int m_frameRate;
-    int m_width;
-    int m_height;
-    int64_t m_pts;
-    int m_encoderFailCount;  // 编码器初始化连续失败计数
-    int m_encType;           // 相机编码类型：0-h264, 1-MPEG4, 2-MJPEG, 3-h265
-    int m_inputW;            // sws 输入宽（变化时需重建上下文，防止 sws_scale 越界）
-    int m_inputH;            // sws 输入高
-    int m_inputFmt;          // sws 输入像素格式
-    int m_writeFailCount;    // 录像写盘连续失败计数
-    bool m_headerWritten = false;  // R-06: avformat_write_header 是否成功
+    std::atomic<bool> m_running{false};
 
-    // 解码
-    VideoDecoder m_decoder;
+    mutable QMutex m_paramMutex;
+    AVCodecParameters *m_srcPar = nullptr;
+    AVRational m_srcTimeBase{1, 25};
+    AVRational m_srcFrameRate{25, 1};
 
-    // FFmpeg 相关 - 编码和封装
-    AVFormatContext* m_formatContext;
-    AVStream* m_videoStream;
-    const AVCodec* m_encoder;
-    AVCodecContext* m_encoderCtx;
-    AVPacket* m_packet;
-    SwsContext* m_swsCtx;
-    AVFrame* m_yuvFrame;
-    uint8_t* m_yuvBuffer[4];
-    int m_yuvLinesize[4];
+    QMutex m_abortMutex;
+    QString m_abortReason;
+
+    AVFormatContext *m_formatContext = nullptr;
+    AVStream *m_videoStream = nullptr;
+    bool m_headerWritten = false;
+    int m_writeFailCount = 0;
+
+    // 时间戳归零基准：RTSP 的 pts/dts 通常是设备开机时钟（如 419 秒），
+    // 原样写入 MP4 会得到巨大的 start_time，导致播放器无法播放或时长错乱
+    int64_t m_tsOffset = AV_NOPTS_VALUE;
+    int64_t m_lastDts = AV_NOPTS_VALUE;
 };
 
 #endif // RECORDTHREAD_H

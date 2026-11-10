@@ -21,6 +21,7 @@ DeviceManager::DeviceManager(QObject *parent)
     m_rtspSource = new RtspSource(m_decodeThread, this);
     m_rtspSource->setRecordThread(m_recordThread, &m_isRecording);
     connect(m_rtspSource, &RtspSource::streamConnected, this, &DeviceManager::onRtspStreamConnected);
+    connect(m_rtspSource, &RtspSource::streamInfo, this, &DeviceManager::streamInfo);
     connect(m_rtspSource, &RtspSource::streamError, this, &DeviceManager::onRtspStreamError);
 
     m_lensManager = new LensManager(this);
@@ -94,6 +95,10 @@ bool DeviceManager::logout()
 {
     stopStream();
     stopRecord();
+    // 录像线程需要收尾写 trailer，等它退出后再登出/销毁
+    if (m_recordThread && m_recordThread->isRunning()) {
+        m_recordThread->wait(2000);
+    }
 
     if (m_sdkSession) {
         m_sdkSession->logout();
@@ -161,12 +166,40 @@ bool DeviceManager::stopStream()
 bool DeviceManager::startRecord(const QString& filePath)
 {
     if (!m_recordThread) return false;
-    bool ok = m_recordThread->initRecord(filePath, 25);
-    if (ok) {
-        m_isRecording.store(true);
-        emit recordStarted();
+
+    if (m_isRecording.load()) {
+        emit errorOccurred("录像已在进行中");
+        return false;
     }
-    return ok;
+    if (!isStreaming()) {
+        emit errorOccurred("视频未开始预览，无法录像");
+        return false;
+    }
+
+    // 上一次录像可能仍在收尾（写 trailer），先等它退出再复位队列
+    if (m_recordThread->isRunning()) {
+        m_recordThread->stopRecord();
+        if (!m_recordThread->wait(2000)) {
+            emit errorOccurred("上一次录像尚未结束，请稍后重试");
+            return false;
+        }
+    }
+
+    if (!m_recordThread->initRecord(filePath)) {
+        return false;
+    }
+
+    // 先置位再启动线程，保证 RTSP 线程收到的首批关键帧不会被丢弃
+    m_isRecording.store(true);
+    m_recordThread->start();
+    if (!m_recordThread->isRunning()) {
+        m_isRecording.store(false);
+        emit errorOccurred("录像线程启动失败");
+        return false;
+    }
+
+    emit recordStarted();
+    return true;
 }
 
 void DeviceManager::stopRecord()
@@ -185,9 +218,6 @@ void DeviceManager::onFrameDecoded(const QImage &frame)
 void DeviceManager::onRtspStreamConnected(int encType)
 {
     qInfo() << "[DeviceManager] RTSP 视频流连接成功, 编码类型:" << (encType == 3 ? "H.265" : "H.264");
-    if (m_recordThread) {
-        m_recordThread->setEncType(encType);
-    }
     emit streamStarted(true);
 }
 
@@ -207,11 +237,14 @@ void DeviceManager::onPTZAngleReceived(float pan, float tilt, float panSpeed, fl
 
 void DeviceManager::onRecordError(const QString &error)
 {
+    m_isRecording.store(false);
     emit errorOccurred(QString("录像错误: %1").arg(error));
+    emit recordFailed(error);
 }
 
 void DeviceManager::onRecordFinished(const QString &filePath)
 {
+    m_isRecording.store(false);
     emit recordStopped(filePath);
 }
 

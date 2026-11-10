@@ -59,8 +59,10 @@ signals:
     void errorOccurred(const QString &error);
     void frameReceived(const QImage &frame);
     void streamStarted(bool ok);
+    void streamInfo(const QString &info);
     void recordStarted();
     void recordStopped(const QString &filePath);
+    void recordFailed(const QString &error);
     void ptzAngleReceived(float pan, float tilt);
 
 private slots:

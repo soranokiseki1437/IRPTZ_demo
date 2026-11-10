@@ -185,14 +185,17 @@
           </item>
           <item row="1" column="1" colspan="2">
            <widget class="QSpinBox" name="spinBoxQuality">
+            <property name="toolTip">
+             <string>0=最好，1=较好，2=一般</string>
+            </property>
             <property name="minimum">
-             <number>1</number>
+             <number>0</number>
             </property>
             <property name="maximum">
-             <number>100</number>
+             <number>2</number>
             </property>
             <property name="value">
-             <number>80</number>
+             <number>1</number>
             </property>
            </widget>
           </item>
@@ -663,76 +666,41 @@
              </item>
              <item row="0" column="1" colspan="3">
               <widget class="QDoubleSpinBox" name="spinSpeed">
+               <property name="toolTip">
+                <string>1=最慢，7=最快</string>
+               </property>
+               <property name="decimals">
+                <number>0</number>
+               </property>
                <property name="minimum">
-                <double>0.000000000000000</double>
+                <double>1.000000000000000</double>
                </property>
                <property name="maximum">
-                <double>1.000000000000000</double>
+                <double>7.000000000000000</double>
                </property>
                <property name="singleStep">
-                <double>0.050000000000000</double>
-               </property>
-               <property name="value">
                 <double>1.000000000000000</double>
                </property>
-              </widget>
-             </item>
-             <item row="1" column="0">
-              <widget class="QLabel" name="label_3">
-               <property name="text">
-                <string>水平:</string>
-               </property>
-              </widget>
-             </item>
-             <item row="1" column="1">
-              <widget class="QDoubleSpinBox" name="spinPan">
-               <property name="minimum">
-                <double>-180.000000000000000</double>
-               </property>
-               <property name="maximum">
-                <double>180.000000000000000</double>
-               </property>
-              </widget>
-             </item>
-             <item row="1" column="2">
-              <widget class="QLabel" name="label_4">
-               <property name="text">
-                <string>垂直:</string>
-               </property>
-              </widget>
-             </item>
-             <item row="1" column="3">
-              <widget class="QDoubleSpinBox" name="spinTilt">
-               <property name="minimum">
-                <double>-90.000000000000000</double>
-               </property>
-               <property name="maximum">
-                <double>90.000000000000000</double>
+               <property name="value">
+                <double>4.000000000000000</double>
                </property>
               </widget>
              </item>
              <item row="2" column="0">
-              <widget class="QPushButton" name="btnMove">
-               <property name="text">
-                <string>移动</string>
-               </property>
-              </widget>
-             </item>
-             <item row="2" column="1">
               <widget class="QPushButton" name="btnStop">
                <property name="text">
                 <string>急停</string>
                </property>
               </widget>
              </item>
-             <item row="2" column="2">
+             <item row="2" column="1">
               <widget class="QPushButton" name="btnReset">
                <property name="text">
                 <string>复位</string>
                </property>
               </widget>
              </item>
-             <item row="2" column="3">
+             <item row="2" column="2">
               <widget class="QPushButton" name="btnQuery">
                <property name="text">
                 <string>查询</string>
@@ -747,6 +715,65 @@
               </widget>
              </item>
             </layout>
+           </item>
+           <item>
+            <widget class="QGroupBox" name="groupCruise">
+             <property name="title">
+              <string>自动巡航</string>
+             </property>
+             <layout class="QGridLayout" name="gridLayoutCruise">
+              <item row="0" column="0">
+               <widget class="QLabel" name="labelCruiseSeconds">
+                <property name="toolTip">
+                 <string>巡航总时长：从开始到自动停止的时间；转速由上面的速度档位决定</string>
+                </property>
+                <property name="text">
+                 <string>巡航总时长:</string>
+                </property>
+               </widget>
+              </item>
+              <item row="0" column="1">
+               <widget class="QSpinBox" name="spinCruiseSeconds">
+                <property name="toolTip">
+                 <string>到达总时长后自动停止，可随时点“停止巡航”</string>
+                </property>
+                <property name="minimum">
+                 <number>5</number>
+                </property>
+                <property name="maximum">
+                 <number>3600</number>
+                </property>
+                <property name="value">
+                 <number>60</number>
+                </property>
+                <property name="suffix">
+                 <string> 秒</string>
+                </property>
+               </widget>
+              </item>
+              <item row="1" column="0">
+               <widget class="QPushButton" name="btnCruiseStart">
+                <property name="text">
+                 <string>开始巡航</string>
+                </property>
+               </widget>
+              </item>
+              <item row="1" column="1">
+               <widget class="QPushButton" name="btnCruiseStop">
+                <property name="text">
+                 <string>停止巡航</string>
+                </property>
+               </widget>
+              </item>
+              <item row="2" column="0" colspan="2">
+               <widget class="QLabel" name="labelCruiseStatus">
+                <property name="text">
+                 <string>未巡航</string>
+                </property>
+               </widget>
+              </item>
+             </layout>
+            </widget>
            </item>
           </layout>
          </widget>
@@ -774,49 +801,21 @@
              </property>
             </widget>
            </item>
-           <item row="0" column="2">
-            <widget class="QCheckBox" name="checkBoxManualFocus">
-             <property name="text">
-              <string>手动聚焦</string>
-             </property>
-            </widget>
-           </item>
            <item row="1" column="0">
-            <widget class="QPushButton" name="btnIrisOpen">
-             <property name="text">
-              <string>光圈扩大</string>
-             </property>
-            </widget>
-           </item>
-           <item row="1" column="1">
-            <widget class="QPushButton" name="btnIrisClose">
-             <property name="text">
-              <string>光圈缩小</string>
-             </property>
-            </widget>
-           </item>
-           <item row="1" column="2">
-            <widget class="QCheckBox" name="checkBoxManualIris">
-             <property name="text">
-              <string>手动光圈</string>
-             </property>
-            </widget>
-           </item>
-           <item row="2" column="0">
             <widget class="QPushButton" name="btnZoomIn">
              <property name="text">
               <string>变倍放大</string>
              </property>
             </widget>
            </item>
-           <item row="2" column="1">
+           <item row="1" column="1">
             <widget class="QPushButton" name="btnZoomOut">
              <property name="text">
               <string>变倍缩小</string>
              </property>
             </widget>
            </item>
-           <item row="2" column="2">
+           <item row="1" column="2">
             <layout class="QHBoxLayout" name="layoutLensSpeed">
              <property name="spacing">
               <number>4</number>
@@ -1150,10 +1149,16 @@
     <property name="title">
      <string>菜单</string>
     </property>
+    <addaction name="actionTaskBoard"/>
     <addaction name="actionExit"/>
    </widget>
    <addaction name="menuFile"/>
   </widget>
+  <action name="actionTaskBoard">
+   <property name="text">
+    <string>长任务看板</string>
+   </property>
+  </action>
   <action name="actionExit">
    <property name="text">
     <string>退出</string>
